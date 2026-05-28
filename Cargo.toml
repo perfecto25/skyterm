@@ -4,10 +4,10 @@ members = ["skyterm-core", "skyterm-gui"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2026"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/mreider/skyterm"
+repository = "https://github.com/perfecto25/skyterm"
 
 [workspace.dependencies]
 vte = "0.15"

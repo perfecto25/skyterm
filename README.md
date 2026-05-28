@@ -72,3 +72,9 @@ Pane cycling
 cargo build --release
 
 binary is located in target/release/skyterm
+
+
+### Roadmap
+
+- add documentation on themes
+- add Info section to menu that shows skyterm version
