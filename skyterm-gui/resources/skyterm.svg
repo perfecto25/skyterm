@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Terminal body: deep-blue rounded rectangle, matching the Skyterm Blue theme bg. -->
+  <rect x="4" y="22" width="56" height="38" rx="5" fill="#0c293d"/>
+
+  <!-- Faux prompt glyph in the mint-green foreground colour so the rectangle
+       reads as a terminal at a glance. -->
+  <text x="11" y="46"
+        font-family="monospace, sans-serif"
+        font-size="16"
+        font-weight="700"
+        fill="#adffcc">$_</text>
+
+  <!-- Small white cloud hovering above the terminal. Three overlapping
+       circles plus a base rectangle make a clean rounded silhouette at any
+       size. -->
+  <g fill="#ffffff">
+    <circle cx="24" cy="14" r="5"/>
+    <circle cx="32" cy="10" r="6"/>
+    <circle cx="40" cy="13" r="5"/>
+    <rect x="24" y="14" width="16" height="6" rx="3"/>
+  </g>
+</svg>

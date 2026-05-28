@@ -1,0 +1,17 @@
+[package]
+name = "skyterm-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless terminal engine: VT parser + grid model. No GUI deps."
+
+[dependencies]
+vte = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }

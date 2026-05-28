@@ -1,0 +1,26 @@
+[package]
+name = "skyterm-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GTK4 + OpenGL skyterm front-end."
+
+[[bin]]
+name = "skyterm"
+path = "src/main.rs"
+
+[dependencies]
+skyterm-core = { path = "../skyterm-core" }
+gtk4 = { version = "0.11", features = ["v4_12"] }
+glow = "0.13"
+epoxy = "0.1"
+libloading = "0.8"
+freetype-rs = "0.36"
+portable-pty = "0.9"
+async-channel = "2"
+anyhow = "1"
+log = { workspace = true }
+env_logger = { workspace = true }
+bytemuck = { version = "1.14", features = ["derive"] }

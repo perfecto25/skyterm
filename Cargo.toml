@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["skyterm-core", "skyterm-gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mreider/skyterm"
+
+[workspace.dependencies]
+vte = "0.15"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+debug = false
+strip = true
+lto = "thin"
+codegen-units = 1
+panic = "abort"
