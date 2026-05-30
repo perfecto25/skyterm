@@ -78,3 +78,4 @@ binary is located in target/release/skyterm
 
 - add documentation on themes
 - add Info section to menu that shows skyterm version
+- add ability to view images in terminal
