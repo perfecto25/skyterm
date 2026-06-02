@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Must be run on macOS. Produces Skyterm.app + Skyterm.dmg.
+#
+# Extra arguments are forwarded to `cargo build`, so e.g.
+#   ./package-macos.sh --offline
+# does a fully offline build (assuming crates are already in ~/.cargo).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# Anything passed to the script gets forwarded to `cargo build` below.
+CARGO_EXTRA_ARGS=("$@")
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -37,6 +44,19 @@ check_deps() {
     command -v cargo         &>/dev/null || die "cargo not found"
     command -v brew          &>/dev/null || die "Homebrew not found — install from https://brew.sh"
 
+    local brew_prefix
+    brew_prefix="$(brew --prefix)"
+
+    if ! command -v pkg-config &>/dev/null; then
+        warn "pkg-config not found — installing pkgconf via Homebrew..."
+        brew install pkgconf
+    fi
+
+    if ! brew list --formula gtk4 &>/dev/null; then
+        warn "gtk4 not found — installing via Homebrew (this can take a while)..."
+        brew install gtk4
+    fi
+
     if ! command -v dylibbundler &>/dev/null; then
         warn "dylibbundler not found — installing via Homebrew..."
         brew install dylibbundler
@@ -47,7 +67,16 @@ check_deps() {
         brew install create-dmg
     fi
 
-    info "Prerequisites OK"
+    # gdk4-sys / gtk4-sys etc. resolve gtk4.pc through pkg-config; make sure the
+    # Homebrew pkgconfig paths are on PKG_CONFIG_PATH before cargo runs the
+    # gtk4-sys build script.
+    export PKG_CONFIG_PATH="${brew_prefix}/lib/pkgconfig:${brew_prefix}/share/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+    if ! pkg-config --exists 'gtk4 >= 4.12'; then
+        die "pkg-config still can't find 'gtk4 >= 4.12' after install — check 'brew doctor' and PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
+    fi
+
+    info "Prerequisites OK (gtk4 $(pkg-config --modversion gtk4))"
 }
 
 # ── Build ────────────────────────────────────────────────────────────────────
@@ -55,10 +84,18 @@ check_deps() {
 build_release() {
     info "Building release binary..."
 
+    # `--locked` is intentionally NOT passed here: it refuses to create/update
+    # Cargo.lock, which makes the script fail on Macs that downloaded the
+    # source without Cargo.lock (zip/tarball instead of `git clone`). For
+    # reproducible CI builds, run cargo with --locked directly. Any extra
+    # args passed to this script are forwarded — e.g. `./package-macos.sh
+    # --offline` to build without network access.
+    # `${arr[@]+"${arr[@]}"}` expands to nothing when the array is empty —
+    # plain `"${arr[@]}"` would trip `set -u` on macOS bash 3.2.
     cargo build \
         --release \
         --package skyterm-gui \
-        --locked
+        ${CARGO_EXTRA_ARGS[@]+"${CARGO_EXTRA_ARGS[@]}"}
 
     [[ -f "target/release/${BINARY_NAME}" ]] \
         || die "Binary not found at target/release/${BINARY_NAME}"

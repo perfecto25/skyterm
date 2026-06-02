@@ -47,25 +47,58 @@ Skyterm aims to be basic, fast and no-nonsense terminal emulator tailored for sy
 
 all Skyterm actions are available through a menu (right click to open menu) or through a keyboard shortcut.
 
+
 #### Zoom
 
 to zoom in on pane content 
 
+```
+Linux
+
     Ctrl + "+" (zoom in)
     Ctrl + "-" (zoom out)
+```
+
+```
+MacOS
+
+    Command + "+" (zoom in)
+    Command + "-"  (zoom out)
+```
 
 or with mouse
 
-    Ctrl + mouse scroll up
-    Ctrl + mouse scroll down
+```
+Linux
+
+    Ctrl + mouse scroll up (zoom in)
+    Ctrl + mouse scroll down (zoom out)
+```
+
+```
+MacOS
+
+    Command + mouse scroll up (zoom out)
+    Command + mouse scroll down (zoom in)
+```
 
 #### Tabs
 
 open new Tab
 
-    Ctrl+A → T
+```
+Linux
 
-rename a Tab
+    Ctrl+A → T
+```
+
+```
+MacOS
+
+    Command + A → T
+```
+
+**rename a Tab**
 
 by default, each tab will be named Tab + incremented number, to change the name of each tab, double click on Tab header and type in a new name, hit Enter
 
@@ -73,18 +106,45 @@ by default, each tab will be named Tab + incremented number, to change the name 
 
 Split panes
 
+```
+Linux
+
     Ctrl+A → Right key  (split pane right)
     Ctrl+A → Left key  (split pane left)
     Ctrl+A → Up key  (split pane right)
     Ctrl+A → Down key  (split pane down)
+```
+
+```
+MacOS
+
+    Command+A → Right key  (split pane right)
+    Command+A → Left key  (split pane left)
+    Command+A → Up key  (split pane right)
+    Command+A → Down key  (split pane down)
+```
 
 Pane cycling
+
+```
+Linux
 
     Ctrl+A → o	Cycle to the next pane in the tab
     Ctrl+A → h	Focus pane to the left
     Ctrl+A → j	Focus pane below
     Ctrl+A → k	Focus pane above
     Ctrl+A → l	Focus pane to the right
+```
+
+```
+MacOS
+
+    Command+A → o	Cycle to the next pane in the tab
+    Command+A → h	Focus pane to the left
+    Command+A → j	Focus pane below
+    Command+A → k	Focus pane above
+    Command+A → l	Focus pane to the right
+```
 
 
 #### Copy and paste
@@ -96,6 +156,23 @@ Copy
 Paste 
 
     Shift + Ctrl + v
+
+
+#### Theme scrolling
+
+You can scroll through available themes and see how they look
+
+```
+Linux
+
+    hold down Ctrl + A and hit ' or / to cycle up or down a theme
+```
+
+```
+MacOS
+
+    hold down Command + A and hit ' or / to cycle up or down a theme
+```
 
 ### Custom configuration
 
@@ -156,3 +233,4 @@ for MacOS builds
 - add documentation on themes, add ability to integrate custom themes via terminator-style config files
 - add ability to view images in terminal
 - add syntax highlighter for bash, python, json, yaml via cat
+- add ability to modify keyboard shortcuts via config file
