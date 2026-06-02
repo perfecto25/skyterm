@@ -999,13 +999,17 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
 
     // PTY read loop — feeds bytes into this pane's parser, returns DSR/DA
     // responses, kicks a redraw. Holds only a Weak<Pane> so the loop exits
-    // once the pane is dropped.
+    // once the pane is dropped. When the channel closes (shell exited and the
+    // reader thread hit EOF on the PTY master) the loop falls out and we close
+    // the pane — otherwise typing into the dead PTY blocks the GLib main loop
+    // when the master's tty buffer eventually fills up.
     {
         let pane_w = Rc::downgrade(&pane);
+        let state_for_exit = state.clone();
         glib::spawn_future_local(async move {
             while let Ok(bytes) = rx.recv().await {
                 let Some(p) = pane_w.upgrade() else {
-                    break;
+                    return;
                 };
                 log::debug!("pty<- {:?}", DebugBytes(&bytes));
                 let responses = {
@@ -1023,6 +1027,13 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
                 }
                 sync_scrollbar(&p);
                 p.gl_area.queue_render();
+            }
+            // Channel closed → shell exited. Close this pane; close_pane folds
+            // through to close_tab when this was the tab's last pane, which in
+            // turn closes the window when it was the last tab.
+            if let Some(p) = pane_w.upgrade() {
+                log::info!("pty channel closed, closing pane");
+                close_pane(&state_for_exit, &p);
             }
         });
     }
