@@ -24,3 +24,32 @@ anyhow = "1"
 log = { workspace = true }
 env_logger = { workspace = true }
 bytemuck = { version = "1.14", features = ["derive"] }
+
+[package.metadata.generate-rpm]
+name = "skyterm"
+summary = "GPU-rendered terminal emulator"
+license = "MIT"
+assets = [
+    { source = "../target/release/skyterm", dest = "/usr/bin/skyterm", mode = "0755" },
+    { source = "resources/skyterm.svg", dest = "/usr/share/icons/hicolor/scalable/apps/skyterm.svg", mode = "0644" },
+    { source = "resources/skyterm.desktop", dest = "/usr/share/applications/skyterm.desktop", mode = "0644" },
+]
+
+[package.metadata.generate-rpm.requires]
+"gtk4" = ">= 4.12"
+freetype = "*"
+mesa-libGL = "*"
+
+[package.metadata.deb]
+name = "skyterm"
+maintainer = "skyterm contributors"
+copyright = "2024, skyterm contributors"
+license-file = ["../LICENSE-MIT", "4"]
+depends = "libgtk-4-1 (>= 4.12), libfreetype6, libgl1"
+section = "x11"
+priority = "optional"
+assets = [
+    ["../target/release/skyterm", "usr/bin/skyterm", "755"],
+    ["resources/skyterm.svg", "usr/share/icons/hicolor/scalable/apps/skyterm.svg", "644"],
+    ["resources/skyterm.desktop", "usr/share/applications/skyterm.desktop", "644"],
+]

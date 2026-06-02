@@ -10,12 +10,13 @@ use gtk4::glib::object::Cast;
 use gtk4::prelude::*;
 use gtk4::{
     gdk, glib, Adjustment, Application, ApplicationWindow, CssProvider,
-    EventControllerKey, EventControllerScroll, EventControllerScrollFlags, GLArea,
+    Entry, EventControllerFocus, EventControllerKey, EventControllerScroll,
+    EventControllerScrollFlags, GLArea,
     GestureClick, GestureDrag, Orientation, Paned, PopoverMenu, Scrollbar,
 };
 use skyterm_core::{
     theme::Theme,
-    Grid, Parser,
+    Grid, MouseMode, Parser,
 };
 
 use crate::font;
@@ -46,6 +47,17 @@ popover.menu,
 popover.menu label,
 popover.menu modelbutton {
     font-family: \"Fira Code\", monospace;
+}
+popover.menu scrollbar,
+popover.menu scrollbar trough,
+popover.menu scrollbar slider,
+popover.menu overshoot,
+popover.menu undershoot {
+    opacity: 0;
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    padding: 0;
 }
 button.pane-close-btn {
     color: #c0392b;
@@ -100,6 +112,15 @@ struct WindowState {
     theme: Rc<RefCell<Theme>>,
     /// Current font path. Mutable so Settings can swap font families live.
     font_path: Rc<RefCell<PathBuf>>,
+    /// Whether cursor blinking is enabled.
+    cursor_blink: Rc<Cell<bool>>,
+    /// Current blink phase: true = cursor visible. Flipped every 500 ms by the
+    /// blink timer. Always true when blinking is disabled.
+    blink_phase: Rc<Cell<bool>>,
+    /// Whether double-click-word / triple-click-line selection is enabled.
+    click_word_select: Rc<Cell<bool>>,
+    /// Whether making a selection copies it to the clipboard automatically.
+    copy_on_select: Rc<Cell<bool>>,
 }
 
 struct Tab {
@@ -136,6 +157,16 @@ struct Pane {
     /// Drag-to-select range in view-relative cell coordinates. Cleared on
     /// typing or scrolling so it doesn't drift out of sync with the view.
     selection: RefCell<Option<Selection>>,
+    /// True when this pane holds keyboard focus. Only the focused pane blinks
+    /// its cursor; unfocused panes show a static (non-blinking) cursor.
+    is_focused: Cell<bool>,
+    /// Pending debounced reflow timer (see `schedule_reflow`). Holds the latest
+    /// timeout so a burst of resize events collapses into one grid+PTY resize.
+    resize_source: RefCell<Option<glib::SourceId>>,
+    /// Multi-click tracking for word/line selection: (last press time in ms,
+    /// row, col, consecutive count). Used to distinguish single/double/triple
+    /// clicks on the left button without a separate `GestureClick`.
+    click_state: Cell<(u32, usize, usize, u8)>,
     _child: RefCell<Box<dyn portable_pty::Child + Send + Sync>>,
 }
 
@@ -152,15 +183,15 @@ pub fn on_activate(app: &Application) {
 
     let font_path = match cfg.font_path.clone() {
         Some(p) if p.is_file() => p,
-        _ => match font::locate_monospace_font() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("skyterm: {e}");
-                return;
-            }
-        },
+        _ => font::locate_monospace_font().unwrap_or_else(|_| {
+            std::path::PathBuf::from(font::EMBEDDED_FONT_PATH)
+        }),
     };
-    log::info!("skyterm starting — font {}", font_path.display());
+    if font_path.to_str() == Some(font::EMBEDDED_FONT_PATH) {
+        log::info!("skyterm starting — font: embedded JetBrains Mono Regular");
+    } else {
+        log::info!("skyterm starting — font {}", font_path.display());
+    }
 
     install_css();
 
@@ -181,14 +212,16 @@ pub fn on_activate(app: &Application) {
         .default_height((INITIAL_ROWS as u32 * initial_atlas.cell_h) as i32)
         .build();
 
+    // Themes are needed both for the submenu and for WindowState.
+    let mut available_themes: Vec<Theme> = Theme::presets();
+    available_themes.extend(load_user_themes());
+
     // Build the two menu variants. They share the splits + clipboard
     // sections (gio::Menu sections are referenced, not copied), so we only
     // need to define them once.
     let splits = gio::Menu::new();
     splits.append(Some("Split pane >"), Some("pane.split-right"));
-    //splits.append(Some("Split <"), Some("pane.split-left"));
     splits.append(Some("Split pane ^ "), Some("pane.split-up"));
-    //splits.append(Some("Split pane ↓"), Some("pane.split-down"));
     splits.append(Some("New tab"), Some("pane.new-tab"));
 
     let clipboard = gio::Menu::new();
@@ -196,8 +229,29 @@ pub fn on_activate(app: &Application) {
     clipboard.append(Some("Paste"), Some("pane.paste"));
     clipboard.append(Some("Select All"), Some("pane.select-all"));
 
+    // Themes submenu — dark and light as labelled sections.
+    let dark_items = gio::Menu::new();
+    let light_items = gio::Menu::new();
+    for t in &available_themes {
+        let item = gio::MenuItem::new(Some(t.name.as_str()), None);
+        item.set_action_and_target_value(
+            Some("pane.set-theme"),
+            Some(&t.name.to_variant()),
+        );
+        if t.is_dark() {
+            dark_items.append_item(&item);
+        } else {
+            light_items.append_item(&item);
+        }
+    }
+    let themes_submenu = gio::Menu::new();
+    themes_submenu.append_section(Some("Dark"), &dark_items);
+    themes_submenu.append_section(Some("Light"), &light_items);
+
     let prefs = gio::Menu::new();
+    prefs.append_submenu(Some("Themes"), &themes_submenu);
     prefs.append(Some("Settings…"), Some("pane.settings"));
+    prefs.append(Some("About…"), Some("pane.about"));
 
     // The destructive-action section uses a custom widget so we can render
     // the red close styling the standard menu model can't express.
@@ -227,14 +281,16 @@ pub fn on_activate(app: &Application) {
     notebook.set_show_border(false);
     window.set_child(Some(&notebook));
 
-    let mut available_themes: Vec<Theme> = Theme::presets();
-    available_themes.extend(load_user_themes());
-
     let initial_theme = cfg
         .theme_name
         .as_deref()
         .and_then(|name| available_themes.iter().find(|t| t.name == name).cloned())
         .unwrap_or_else(Theme::default);
+
+    let cursor_blink = Rc::new(Cell::new(cfg.cursor_blink.unwrap_or(true)));
+    let blink_phase = Rc::new(Cell::new(true));
+    let click_word_select = Rc::new(Cell::new(cfg.click_word_select.unwrap_or(true)));
+    let copy_on_select = Rc::new(Cell::new(cfg.copy_on_select.unwrap_or(false)));
 
     let state = Rc::new(WindowState {
         tabs: RefCell::new(Vec::new()),
@@ -248,7 +304,31 @@ pub fn on_activate(app: &Application) {
         theme: Rc::new(RefCell::new(initial_theme)),
         font_path: Rc::new(RefCell::new(font_path)),
         available_themes,
+        cursor_blink: cursor_blink.clone(),
+        blink_phase: blink_phase.clone(),
+        click_word_select: click_word_select.clone(),
+        copy_on_select: copy_on_select.clone(),
     });
+
+    // Cursor blink tick (500 ms). Only does work when blinking is enabled:
+    // flips the phase and re-renders the current tab's panes.
+    {
+        let state_w = Rc::downgrade(&state);
+        glib::timeout_add_local(Duration::from_millis(500), move || {
+            let Some(state) = state_w.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if state.cursor_blink.get() {
+                state.blink_phase.set(!state.blink_phase.get());
+                if let Some(tab) = current_tab(&state) {
+                    for p in tab.panes.borrow().iter() {
+                        p.gl_area.queue_render();
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
 
     install_pane_actions(&window, &state);
 
@@ -370,6 +450,37 @@ fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
         });
     }
     group.add_action(&settings_action);
+
+    let about_action = gio::SimpleAction::new("about", None);
+    {
+        let state = state.clone();
+        about_action.connect_activate(move |_, _| {
+            open_about(&state);
+        });
+    }
+    group.add_action(&about_action);
+
+    // Applies a named theme to the right-clicked pane only (per-pane theme).
+    let set_theme = gio::SimpleAction::new("set-theme", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        set_theme.connect_activate(move |_, param| {
+            let name = param
+                .and_then(|v| v.get::<String>())
+                .unwrap_or_default();
+            let Some(pane) = state.menu_target.borrow().clone() else { return };
+            if let Some(theme) = state
+                .available_themes
+                .iter()
+                .find(|t| t.name == name)
+                .cloned()
+            {
+                *pane.theme.borrow_mut() = theme;
+                pane.gl_area.queue_render();
+            }
+        });
+    }
+    group.add_action(&set_theme);
 
     window.insert_action_group("pane", Some(&group));
 }
@@ -499,13 +610,105 @@ fn make_tab(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Tab>> {
     state.next_tab_number.set(tab_number + 1);
     let title_label = gtk4::Label::new(Some(&format!("Tab {tab_number}")));
     title_label.set_xalign(0.0);
+
+    // Pre-create the rename entry as a hidden sibling in the same box.
+    // Toggling visibility (never add/remove) avoids the re-entrant GTK signals
+    // that fire during gtk_box_remove and cause Gtk-CRITICAL parent-lookup failures.
+    let title_entry = Entry::new();
+    title_entry.set_max_width_chars(32);
+    title_entry.set_visible(false);
+
     let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
     close_btn.set_has_frame(false);
     close_btn.add_css_class("flat");
+
     let tab_label = gtk4::Box::new(Orientation::Horizontal, 6);
     tab_label.append(&title_label);
+    tab_label.append(&title_entry);
     tab_label.append(&close_btn);
 
+    // Rename interaction — double-click label to start, Enter/focus-out to
+    // commit, Escape to cancel. The entry's own visibility is the guard:
+    // if it is already hidden when a handler fires, the rename is already done.
+    {
+        let lbl_w = title_label.clone();
+        let ent_w = title_entry.clone();
+        let gl_area_w = pane.gl_area.downgrade();
+
+        // commit: save, swap back to label, restore terminal focus
+        let commit: Rc<dyn Fn()> = Rc::new({
+            let lbl = lbl_w.clone();
+            let ent = ent_w.clone();
+            let gla = gl_area_w.clone();
+            move || {
+                if !gtk4::prelude::WidgetExt::is_visible(&ent) { return; }
+                let text = ent.text().trim().to_string();
+                if !text.is_empty() { lbl.set_text(&text); }
+                ent.set_visible(false);
+                lbl.set_visible(true);
+                if let Some(gl) = gla.upgrade() { gl.grab_focus(); }
+            }
+        });
+
+        // Enter → commit
+        {
+            let c = commit.clone();
+            title_entry.connect_activate(move |_| c());
+        }
+
+        // Escape → cancel (revert, don't save)
+        let key_ctrl = EventControllerKey::new();
+        key_ctrl.connect_key_pressed({
+            let lbl = lbl_w.clone();
+            let ent = ent_w.clone();
+            let gla = gl_area_w.clone();
+            move |_, keyval, _, _| {
+                if keyval == gdk::Key::Escape {
+                    if gtk4::prelude::WidgetExt::is_visible(&ent) {
+                        ent.set_visible(false);
+                        lbl.set_visible(true);
+                        if let Some(gl) = gla.upgrade() { gl.grab_focus(); }
+                    }
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            }
+        });
+        title_entry.add_controller(key_ctrl);
+
+        // Focus-out → commit (e.g. user clicks a pane without pressing Enter)
+        let focus_ctrl = EventControllerFocus::new();
+        focus_ctrl.connect_leave({
+            let c = commit;
+            move |_| c()
+        });
+        title_entry.add_controller(focus_ctrl);
+
+        // Double-click the label → begin rename
+        let dbl = GestureClick::new();
+        dbl.set_button(gdk::BUTTON_PRIMARY);
+        dbl.connect_pressed({
+            let lbl = lbl_w;
+            let ent = ent_w;
+            move |gesture, n_press, _, _| {
+                if n_press < 2 {
+                    // Let single-clicks through to the notebook's tab-switch.
+                    gesture.set_state(gtk4::EventSequenceState::Denied);
+                    return;
+                }
+                let current = lbl.label().to_string();
+                ent.set_text(&current);
+                ent.set_width_chars((current.len() as i32).max(8));
+                lbl.set_visible(false);
+                ent.set_visible(true);
+                ent.grab_focus();
+                ent.select_region(0, -1);
+            }
+        });
+        title_label.add_controller(dbl);
+    }
+
+    pane.is_focused.set(true);
     let tab = Rc::new(Tab {
         container,
         panes: RefCell::new(vec![pane.clone()]),
@@ -678,8 +881,11 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
         font_size: Cell::new(DEFAULT_FONT_SIZE_PX),
         cell_dims: Cell::new((cell_w, cell_h)),
         font_path: state.font_path.clone(),
-        theme: state.theme.clone(),
+        theme: Rc::new(RefCell::new(state.theme.borrow().clone())),
         selection: RefCell::new(None),
+        is_focused: Cell::new(false),
+        resize_source: RefCell::new(None),
+        click_state: Cell::new((0, 0, 0, 0)),
         _child: RefCell::new(pty_handle.child),
     });
 
@@ -752,16 +958,30 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
     // resize signal).
     {
         let pane_w = Rc::downgrade(&pane);
+        let cursor_blink = state.cursor_blink.clone();
+        let blink_phase = state.blink_phase.clone();
         pane.gl_area.connect_render(move |area, _ctx| {
             if let Some(p) = pane_w.upgrade() {
+                let w = area.width();
+                let h = area.height();
+                // NOTE: do NOT reflow the grid here. Reflow moves the cursor,
+                // and doing it per-frame during a drag interleaves with the
+                // shell's SIGWINCH prompt redraw, corrupting the screen. Reflow
+                // is debounced in `schedule_reflow` and fires once the size
+                // settles. The render callback only syncs the GL viewport.
                 if let Some(r) = p.renderer.borrow_mut().as_mut() {
-                    let w = area.width();
-                    let h = area.height();
                     if w > 0 && h > 0 {
                         r.resize(w, h);
                     }
                     let sel = *p.selection.borrow();
-                    r.render(&p.grid.borrow(), sel, &p.theme.borrow());
+                    // Blink only on the focused pane; unfocused panes show a
+                    // static visible cursor so they don't distract the user.
+                    let cursor_on = if p.is_focused.get() {
+                        !cursor_blink.get() || blink_phase.get()
+                    } else {
+                        true
+                    };
+                    r.render(&p.grid.borrow(), sel, &p.theme.borrow(), cursor_on);
                 }
             }
             glib::Propagation::Stop
@@ -801,46 +1021,99 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
     Some(pane)
 }
 
+/// Resize the grid + PTY to fit a `(w, h)` pixel area, using the pane's cell
+/// dimensions. No-op if the resulting column/row count is unchanged. Called
+/// both from the GLArea `resize` signal and as a fallback from the render
+/// callback (the signal can be missed across some allocation paths).
+/// Debounce a reflow to fire once the widget size settles. A window drag emits
+/// a burst of resize events; reflowing on each one moves the cursor and fires a
+/// SIGWINCH, and the shell's prompt-redraw responses then interleave with the
+/// next reflow and corrupt the screen. Collapsing the burst into a single
+/// grid+PTY resize gives the shell exactly one clean redraw cycle.
+fn schedule_reflow(p: &Rc<Pane>) {
+    if let Some(id) = p.resize_source.borrow_mut().take() {
+        id.remove();
+    }
+    let pane_w = Rc::downgrade(p);
+    let id = glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
+        let Some(p) = pane_w.upgrade() else {
+            return;
+        };
+        // Clear the stored handle first: this source is one-shot and about to
+        // finish, so a later resize must not try to .remove() a dead id.
+        p.resize_source.replace(None);
+        let (lw, lh) = (p.gl_area.width(), p.gl_area.height());
+        if reflow_to_pixels(&p, lw, lh) {
+            sync_scrollbar(&p);
+            p.gl_area.queue_render();
+        }
+    });
+    p.resize_source.replace(Some(id));
+}
+
+fn reflow_to_pixels(p: &Rc<Pane>, w: i32, h: i32) -> bool {
+    if w <= 0 || h <= 0 {
+        return false;
+    }
+    let (cw, ch) = p.cell_dims.get();
+    if cw == 0 || ch == 0 {
+        return false;
+    }
+    let new_cols = ((w as u32 / cw).max(1)) as u16;
+    let new_rows = ((h as u32 / ch).max(1)) as u16;
+    let (cur_cols, cur_rows) = {
+        let g = p.grid.borrow();
+        (g.cols() as u16, g.rows() as u16)
+    };
+    if new_cols == cur_cols && new_rows == cur_rows {
+        return false;
+    }
+    log::debug!(
+        "reflow: {cur_cols}x{cur_rows} -> {new_cols}x{new_rows} (px {w}x{h}, cell {cw}x{ch})"
+    );
+    p.grid
+        .borrow_mut()
+        .resize(new_cols as usize, new_rows as usize);
+    if let Err(e) = p.master.borrow_mut().resize(portable_pty::PtySize {
+        cols: new_cols,
+        rows: new_rows,
+        pixel_width: w as u16,
+        pixel_height: h as u16,
+    }) {
+        log::warn!("pty resize: {e}");
+    }
+    true
+}
+
 /// Hook a pane up to keyboard, mouse-wheel scroll, click-to-focus, middle-
 /// click paste, and widget resize. Done as a separate step from `make_pane`
 /// because handlers need an `Rc<WindowState>` clone.
 fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
     // Resize → reflow grid + PTY.
+    // connect_resize is a GLArea-specific signal that fires from the render
+    // cycle after size_allocate marks needs_resize. Window resizes reach here
+    // reliably; GtkPaned handle drags are caught by notify::position on the
+    // Paned (wired in split_pane) which calls queue_render() to force the
+    // cycle to run.
     {
         let pane_w = Rc::downgrade(pane);
-        pane.gl_area.connect_resize(move |_area, w, h| {
+        pane.gl_area.connect_resize(move |area, w, h| {
             let Some(p) = pane_w.upgrade() else {
                 return;
             };
+            // The signal's (w, h) are device pixels (framebuffer size) — used
+            // for the GL viewport, which we update immediately so the window
+            // keeps painting during a drag. The grid+PTY reflow is *debounced*:
+            // reflow moves the cursor and triggers a SIGWINCH prompt redraw, so
+            // doing it on every intermediate drag size makes the shell's
+            // redraws interleave and corrupt the screen. We act once the size
+            // settles instead.
+            log::debug!("connect_resize: device {w}x{h}, logical {}x{}", area.width(), area.height());
             if let Some(r) = p.renderer.borrow_mut().as_mut() {
                 r.resize(w, h);
             }
-            if w <= 0 || h <= 0 {
-                return;
-            }
-            let (cw, ch) = p.cell_dims.get();
-            let new_cols = (((w as u32) / cw).max(1)) as u16;
-            let new_rows = (((h as u32) / ch).max(1)) as u16;
-            let (cur_cols, cur_rows) = {
-                let g = p.grid.borrow();
-                (g.cols() as u16, g.rows() as u16)
-            };
-            if new_cols != cur_cols || new_rows != cur_rows {
-                p.grid
-                    .borrow_mut()
-                    .resize(new_cols as usize, new_rows as usize);
-                let r = p.master.borrow_mut().resize(portable_pty::PtySize {
-                    cols: new_cols,
-                    rows: new_rows,
-                    pixel_width: w as u16,
-                    pixel_height: h as u16,
-                });
-                if let Err(e) = r {
-                    log::warn!("pty resize: {e}");
-                }
-            }
-            sync_scrollbar(&p);
             p.gl_area.queue_render();
+            schedule_reflow(&p);
         });
     }
 
@@ -862,8 +1135,9 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
         });
     }
 
-    // Mouse wheel — Ctrl+wheel zooms the *focused* pane (which may not be the
-    // hovered one); plain wheel scrolls this pane's scrollback.
+    // Mouse wheel — Ctrl+wheel zooms the *focused* pane; plain wheel either
+    // forwards scroll events to the PTY (when the app has enabled mouse
+    // reporting) or drives the scrollback view.
     {
         let state = state.clone();
         let pane_w = Rc::downgrade(pane);
@@ -883,15 +1157,58 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
             let Some(p) = pane_w.upgrade() else {
                 return glib::Propagation::Stop;
             };
-            // Scrolling changes which cells the view shows, so any anchored
-            // selection would silently start covering different content.
-            // Clearer to drop it.
-            clear_selection(&p);
-            let lines_per_notch = 3.0;
-            let new_value = (p.scroll_adj.value() + dy * lines_per_notch)
-                .max(p.scroll_adj.lower())
-                .min((p.scroll_adj.upper() - p.scroll_adj.page_size()).max(0.0));
-            p.scroll_adj.set_value(new_value);
+
+            // When the foreground app has enabled mouse reporting, forward
+            // scroll events as synthetic button-64/65 mouse events rather
+            // than moving the scrollback view.
+            {
+                let grid = p.grid.borrow();
+                if grid.mouse_mode != MouseMode::None {
+                    // Repeat once per logical notch (dy is ±1.0 per notch).
+                    let notches = dy.abs().ceil() as usize;
+                    // button 64 = scroll up, 65 = scroll down
+                    let btn: u8 = if dy < 0.0 { 64 } else { 65 };
+                    // Report at cell 1,1 — position is irrelevant for pure
+                    // scroll in most apps (vim, less, man).
+                    let col: u16 = 1;
+                    let row: u16 = 1;
+                    let seq: Vec<u8> = if grid.mouse_sgr {
+                        // SGR: CSI < btn ; col ; row M
+                        format!("\x1b[<{btn};{col};{row}M").into_bytes()
+                    } else {
+                        // X10: CSI M <btn+32> <col+32> <row+32>
+                        vec![0x1b, b'[', b'M', btn + 32, col as u8 + 32, row as u8 + 32]
+                    };
+                    drop(grid);
+                    let mut w = p.writer.borrow_mut();
+                    for _ in 0..notches {
+                        let _ = w.write_all(&seq);
+                    }
+                    return glib::Propagation::Stop;
+                }
+            }
+
+            // No mouse reporting active.
+            // In alt screen (vim, less, man without mouse mode): convert wheel
+            // to arrow key sequences so the app can handle scrolling itself.
+            // In the normal screen: scroll the scrollback view.
+            let in_alt = p.grid.borrow().is_alt_screen();
+            if in_alt {
+                let lines = (dy.abs() * 3.0).round().max(1.0) as usize;
+                // CSI A = cursor up, CSI B = cursor down.
+                let seq: &[u8] = if dy < 0.0 { b"\x1b[A" } else { b"\x1b[B" };
+                let mut w = p.writer.borrow_mut();
+                for _ in 0..lines {
+                    let _ = w.write_all(seq);
+                }
+            } else {
+                clear_selection(&p);
+                let lines_per_notch = 3.0;
+                let new_value = (p.scroll_adj.value() + dy * lines_per_notch)
+                    .max(p.scroll_adj.lower())
+                    .min((p.scroll_adj.upper() - p.scroll_adj.page_size()).max(0.0));
+                p.scroll_adj.set_value(new_value);
+            }
             glib::Propagation::Stop
         });
         pane.gl_area.add_controller(scroll_ctrl);
@@ -908,26 +1225,52 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
         let pane_w = Rc::downgrade(pane);
         let drag = GestureDrag::new();
         drag.set_button(gdk::BUTTON_PRIMARY);
+        // When the foreground app has mouse reporting on, the left button is
+        // forwarded to it (so htop tabs / rows, vim, etc. are clickable).
+        // Holding Shift bypasses reporting and does our local text selection —
+        // the standard xterm escape hatch for copying out of a mouse-aware app.
+        // (`forwards_mouse` is a free fn so all three closures can call it.)
         {
             let state = state.clone();
             let pane_w = pane_w.clone();
-            drag.connect_begin(move |_, _| {
-                if let Some(p) = pane_w.upgrade() {
-                    focus_pane(&state, &p);
-                    clear_selection(&p);
-                }
-            });
-        }
-        {
-            let pane_w = pane_w.clone();
-            drag.connect_drag_begin(move |_, x, y| {
+            drag.connect_begin(move |g, seq| {
                 let Some(p) = pane_w.upgrade() else { return };
-                if let Some(cell) = pixel_to_cell(&p, x, y) {
-                    *p.selection.borrow_mut() = Some(Selection {
-                        anchor: cell,
-                        active: cell,
-                    });
-                    p.gl_area.queue_render();
+                focus_pane(&state, &p);
+                if forwards_mouse(&p, g) {
+                    if let Some((x, y)) = g.point(seq) {
+                        if let Some((row, col)) = pixel_to_cell(&p, x, y) {
+                            send_mouse(&p, 0, MouseAction::Press, col, row);
+                        }
+                    }
+                    return;
+                }
+                // Local press. When word/line selection is enabled, count
+                // consecutive clicks on the same cell: 1 = clear (start a fresh
+                // drag), 2 = word, 3 = line, then cycle. Without a separate
+                // GestureClick (which would conflict with this GestureDrag), we
+                // derive the count from the event timestamp + cell ourselves.
+                let click = g.point(seq).and_then(|(x, y)| pixel_to_cell(&p, x, y));
+                let Some((row, col)) = click else {
+                    clear_selection(&p);
+                    return;
+                };
+                if !state.click_word_select.get() {
+                    clear_selection(&p);
+                    return;
+                }
+                let now = g.current_event_time();
+                let dbl_ms = gtk4::Settings::default()
+                    .map(|s| s.gtk_double_click_time() as u32)
+                    .unwrap_or(400);
+                let (last_t, last_r, last_c, count) = p.click_state.get();
+                let consecutive =
+                    last_r == row && last_c == col && now.wrapping_sub(last_t) <= dbl_ms;
+                let count = if consecutive { count + 1 } else { 1 };
+                p.click_state.set((now, row, col, count));
+                match (count - 1) % 3 {
+                    1 => select_word(&p, row, col),
+                    2 => select_line(&p, row),
+                    _ => clear_selection(&p),
                 }
             });
         }
@@ -936,11 +1279,50 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
             drag.connect_drag_update(move |g, dx, dy| {
                 let Some(p) = pane_w.upgrade() else { return };
                 let Some((sx, sy)) = g.start_point() else { return };
-                if let Some(cell) = pixel_to_cell(&p, sx + dx, sy + dy) {
-                    if let Some(sel) = p.selection.borrow_mut().as_mut() {
-                        sel.active = cell;
+                if forwards_mouse(&p, g) {
+                    // Report drag motion only when the app asked for it
+                    // (?1002 button-event / ?1003 any-event tracking).
+                    let mode = p.grid.borrow().mouse_mode;
+                    if matches!(mode, MouseMode::ButtonMotion | MouseMode::AnyMotion) {
+                        if let Some((row, col)) = pixel_to_cell(&p, sx + dx, sy + dy) {
+                            send_mouse(&p, 0, MouseAction::Motion, col, row);
+                        }
                     }
-                    p.gl_area.queue_render();
+                    return;
+                }
+                let mut sel = p.selection.borrow_mut();
+                if sel.is_none() {
+                    // First motion: anchor at the press origin.
+                    if let Some(anchor) = pixel_to_cell(&p, sx, sy) {
+                        *sel = Some(Selection { anchor, active: anchor });
+                    }
+                }
+                if let Some(active_cell) = pixel_to_cell(&p, sx + dx, sy + dy) {
+                    if let Some(s) = sel.as_mut() {
+                        s.active = active_cell;
+                    }
+                }
+                drop(sel);
+                p.gl_area.queue_render();
+            });
+        }
+        {
+            let state = state.clone();
+            let pane_w = pane_w.clone();
+            drag.connect_end(move |g, seq| {
+                let Some(p) = pane_w.upgrade() else { return };
+                if forwards_mouse(&p, g) {
+                    if let Some((x, y)) = g.point(seq) {
+                        if let Some((row, col)) = pixel_to_cell(&p, x, y) {
+                            send_mouse(&p, 0, MouseAction::Release, col, row);
+                        }
+                    }
+                    return;
+                }
+                // Copy-on-select: on release of a word/line/drag selection,
+                // push it to the clipboard automatically (when enabled).
+                if state.copy_on_select.get() && p.selection.borrow().is_some() {
+                    copy_selection(&p);
                 }
             });
         }
@@ -967,6 +1349,10 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
     let popover = PopoverMenu::from_model(Some(&state.split_menu));
     popover.set_parent(&state.window);
     popover.set_has_arrow(false);
+    // Enforce a minimum width wide enough for the longest theme name
+    // ("Skyterm Dracula" / "Solarized Dark" at ~14 chars in Fira Code 14px)
+    // plus button padding. Height is unconstrained (-1); content drives it.
+    popover.set_size_request(240, -1);
     // PopoverMenu wraps its content in an internal GtkScrolledWindow whose
     // default max-content-height is small enough that our 6-item menu
     // overflows and gets a scrollbar. Override on every show — the inner
@@ -974,7 +1360,19 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
     popover.connect_show(|p| {
         unconstrain_scrolled_windows(p.upcast_ref::<gtk4::Widget>());
     });
-
+    // `visible-submenu` fires synchronously on GTK4 4.8+; belt-and-suspenders
+    // for versions where it works.
+    popover.connect_notify_local(Some("visible-submenu"), |p, _| {
+        unconstrain_scrolled_windows(p.upcast_ref::<gtk4::Widget>());
+        p.queue_resize();
+    });
+    // When the stack switches to a submenu page, GTK4 maps that page's
+    // children. Connect `map` on every ScrolledWindow found at realize time
+    // so that when any SW becomes visible we re-apply unconstrain and force a
+    // resize. This catches submenu pages whether they're built upfront or lazily.
+    popover.connect_realize(|p| {
+        hook_sw_map_signals(p.upcast_ref::<gtk4::Widget>(), p.downgrade());
+    });
     // Custom widget for the menu's "close-pane" slot. The standard menu
     // model can't style individual items, so we hand-render the destructive
     // action as a button with our `pane-close-btn` CSS class.
@@ -1114,7 +1512,16 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
                 return glib::Propagation::Stop;
             }
 
-            // 3) Ctrl+Shift+V — paste from system clipboard.
+            // 3) Ctrl+Shift+C — copy the current selection to the clipboard.
+            if modifiers.contains(gdk::ModifierType::CONTROL_MASK)
+                && modifiers.contains(gdk::ModifierType::SHIFT_MASK)
+                && matches!(keyval, gdk::Key::c | gdk::Key::C)
+            {
+                copy_selection(&p);
+                return glib::Propagation::Stop;
+            }
+
+            // 4) Ctrl+Shift+V — paste from system clipboard.
             if modifiers.contains(gdk::ModifierType::CONTROL_MASK)
                 && modifiers.contains(gdk::ModifierType::SHIFT_MASK)
                 && matches!(keyval, gdk::Key::v | gdk::Key::V)
@@ -1123,7 +1530,7 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
                 return glib::Propagation::Stop;
             }
 
-            // 4) Ctrl+± font zoom on the focused pane.
+            // 5) Ctrl+± font zoom on the focused pane.
             if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
                 let target = focused_pane(&state).unwrap_or_else(|| p.clone());
                 match keyval {
@@ -1143,11 +1550,12 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
                 }
             }
 
-            // 5) Default: encode the keystroke and write to the PTY. Typing
+            // 6) Default: encode the keystroke and write to the PTY. Typing
             // input also clears the selection — the user has clearly moved
             // on from "I'm picking text to copy" — and snaps the view back
             // to the live screen if they were scrolled up.
-            let bytes = input::encode_key(keyval, modifiers);
+            let app_cursor = p.grid.borrow().app_cursor_keys;
+            let bytes = input::encode_key(keyval, modifiers, app_cursor);
             if !bytes.is_empty() {
                 clear_selection(&p);
                 snap_to_bottom(&p);
@@ -1176,7 +1584,10 @@ fn focus_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
             return;
         }
         prev.wrap.remove_css_class("focused");
+        prev.is_focused.set(false);
+        prev.gl_area.queue_render();
     }
+    pane.is_focused.set(true);
     pane.wrap.add_css_class("focused");
     *tab.focused.borrow_mut() = Some(pane.clone());
 
@@ -1268,6 +1679,25 @@ fn split(state: &Rc<WindowState>, focused: &Rc<Pane>, dir: SplitDir) {
             paned.set_start_child(Some(&new_pane.wrap));
             paned.set_end_child(Some(&old_wrap));
         }
+    }
+
+    // When the divider handle is dragged, GTK calls size_allocate on both
+    // children but the GLArea's `resize` signal can be missed. Force a frame
+    // and schedule a (debounced) reflow on both panes whenever the divider
+    // position changes, so split panes rewrap to their new width too.
+    {
+        let old_w = Rc::downgrade(focused);
+        let new_w = Rc::downgrade(&new_pane);
+        paned.connect_notify_local(Some("position"), move |_, _| {
+            if let Some(p) = old_w.upgrade() {
+                p.gl_area.queue_render();
+                schedule_reflow(&p);
+            }
+            if let Some(p) = new_w.upgrade() {
+                p.gl_area.queue_render();
+                schedule_reflow(&p);
+            }
+        });
     }
 
     // The new pane lives in the same tab as the focused one. (`tab_of_pane`
@@ -1379,6 +1809,77 @@ fn close_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
     }
 }
 
+/// Characters that count as part of a "word" for double-click selection.
+/// Beyond alphanumerics this includes the punctuation common in paths, URLs,
+/// and identifiers, so double-clicking a path or flag grabs the whole token.
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric()
+        || matches!(
+            ch,
+            '_' | '-' | '.' | '/' | ':' | '~' | '@' | '%' | '+' | '=' | ',' | '#'
+        )
+}
+
+/// Double-click: select the word under `(row, col)`. A word is a run of
+/// `is_word_char` cells; clicking a non-word cell selects just that cell.
+fn select_word(pane: &Pane, row: usize, col: usize) {
+    let cols = pane.grid.borrow().cols();
+    if cols == 0 || col >= cols {
+        return;
+    }
+    let g = pane.grid.borrow();
+    let (start, end) = if is_word_char(g.visible_cell(row, col).ch) {
+        let mut s = col;
+        while s > 0 && is_word_char(g.visible_cell(row, s - 1).ch) {
+            s -= 1;
+        }
+        let mut e = col;
+        while e + 1 < cols && is_word_char(g.visible_cell(row, e + 1).ch) {
+            e += 1;
+        }
+        (s, e)
+    } else {
+        (col, col)
+    };
+    drop(g);
+    *pane.selection.borrow_mut() = Some(Selection {
+        anchor: (row, start),
+        active: (row, end),
+    });
+    pane.gl_area.queue_render();
+}
+
+/// Triple-click: select the whole logical line through `row`, expanding across
+/// soft-wrapped continuation rows and trimming trailing blanks for a clean copy.
+fn select_line(pane: &Pane, row: usize) {
+    let (rows, cols) = {
+        let g = pane.grid.borrow();
+        (g.rows(), g.cols())
+    };
+    if rows == 0 || cols == 0 || row >= rows {
+        return;
+    }
+    let g = pane.grid.borrow();
+    let mut start = row;
+    while start > 0 && g.visible_row_wrapped(start - 1) {
+        start -= 1;
+    }
+    let mut end = row;
+    while end + 1 < rows && g.visible_row_wrapped(end) {
+        end += 1;
+    }
+    let mut last_col = cols - 1;
+    while last_col > 0 && g.visible_cell(end, last_col).ch == ' ' {
+        last_col -= 1;
+    }
+    drop(g);
+    *pane.selection.borrow_mut() = Some(Selection {
+        anchor: (start, 0),
+        active: (end, last_col),
+    });
+    pane.gl_area.queue_render();
+}
+
 /// Select the entire visible grid. After this, Copy grabs the whole pane.
 fn select_all_pane(pane: &Pane) {
     let (rows, cols) = {
@@ -1414,7 +1915,7 @@ fn copy_selection(pane: &Pane) {
         let sr = sr.min(er);
         let sc = if sr == er { sc.min(ec) } else { sc.min(cols - 1) };
 
-        let mut lines: Vec<String> = Vec::with_capacity(er - sr + 1);
+        let mut out = String::new();
         for r in sr..=er {
             let from = if r == sr { sc } else { 0 };
             let to = if r == er { ec } else { cols - 1 };
@@ -1422,9 +1923,20 @@ fn copy_selection(pane: &Pane) {
             for c in from..=to {
                 line.push(g.visible_cell(r, c).ch);
             }
-            lines.push(line.trim_end().to_string());
+            // A soft-wrapped row's text continues on the next row, so join it
+            // without a newline (and without trimming — it's full width). Only
+            // hard line breaks become `\n`. Matches VTE copy behavior.
+            let soft_wrap = r < er && to == cols - 1 && g.visible_row_wrapped(r);
+            if soft_wrap {
+                out.push_str(&line);
+            } else {
+                out.push_str(line.trim_end());
+                if r < er {
+                    out.push('\n');
+                }
+            }
         }
-        lines.join("\n")
+        out
     };
     if text.is_empty() {
         return;
@@ -1439,19 +1951,104 @@ fn copy_selection(pane: &Pane) {
 /// Walk a widget subtree and reconfigure every `ScrolledWindow` to size to
 /// its natural content height (no scrollbar, no truncation). Used to undo
 /// `PopoverMenu`'s default behavior of wrapping items in a clipped scroller.
+/// Walk the subtree rooted at `widget` and, for every `ScrolledWindow` found,
+/// connect a `map` signal that re-applies `unconstrain_scrolled_windows` on
+/// the whole popover and forces a resize. GTK4 maps a stack page's children
+/// when that page becomes the visible child, so this catches submenu pages
+/// that aren't yet the active page at realize/show time.
+fn hook_sw_map_signals(widget: &gtk4::Widget, weak_pop: glib::WeakRef<PopoverMenu>) {
+    if let Some(sw) = widget.downcast_ref::<gtk4::ScrolledWindow>() {
+        let w = weak_pop.clone();
+        sw.connect_map(move |_| {
+            if let Some(p) = w.upgrade() {
+                unconstrain_scrolled_windows(p.upcast_ref::<gtk4::Widget>());
+                p.queue_resize();
+            }
+        });
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        hook_sw_map_signals(&c, weak_pop.clone());
+        child = c.next_sibling();
+    }
+}
+
 fn unconstrain_scrolled_windows(widget: &gtk4::Widget) {
     if let Some(sw) = widget.downcast_ref::<gtk4::ScrolledWindow>() {
         sw.set_propagate_natural_height(true);
         sw.set_propagate_natural_width(true);
         sw.set_max_content_height(-1);
-        sw.set_vscrollbar_policy(gtk4::PolicyType::Never);
-        sw.set_hscrollbar_policy(gtk4::PolicyType::Never);
+        sw.set_max_content_width(-1);
+        // Do NOT touch vscrollbar_policy / hscrollbar_policy. In GTK4 4.16+
+        // the PopoverMenu uses its internal ScrolledWindow for the page-slide
+        // animation; forcing Policy::Never breaks that and collapses the
+        // popover when navigating to a submenu. Scrollbars are hidden via CSS
+        // (`popover.menu scrollbar { display: none }`) instead.
     }
     let mut child = widget.first_child();
     while let Some(c) = child {
         unconstrain_scrolled_windows(&c);
         child = c.next_sibling();
     }
+}
+
+/// Whether a left-button gesture should be reported to the foreground app
+/// rather than driving local text selection. True when the app enabled mouse
+/// reporting and Shift is not held (Shift is the override for local select).
+fn forwards_mouse(p: &Pane, g: &GestureDrag) -> bool {
+    let shift = g
+        .current_event_state()
+        .contains(gdk::ModifierType::SHIFT_MASK);
+    p.grid.borrow().mouse_mode != MouseMode::None && !shift
+}
+
+/// A mouse button event to report to the foreground app.
+#[derive(Clone, Copy)]
+enum MouseAction {
+    Press,
+    Release,
+    /// Button held + pointer moved (drag), for ?1002/?1003.
+    Motion,
+}
+
+/// Forward a mouse button event to the PTY in whichever protocol the app
+/// enabled. `col`/`row` are 0-based view-relative cells; we convert to the
+/// 1-based coordinates the wire format expects. `button` is 0=left, 1=middle,
+/// 2=right (the scroll wheel uses 64/65 and goes through the scroll handler).
+fn send_mouse(pane: &Pane, button: u8, action: MouseAction, col: usize, row: usize) {
+    let sgr = pane.grid.borrow().mouse_sgr;
+    let c = col as u32 + 1;
+    let r = row as u32 + 1;
+    let seq: Vec<u8> = if sgr {
+        // SGR (?1006): CSI < b ; col ; row (M=press/motion, m=release).
+        let mut b = button as u32;
+        if matches!(action, MouseAction::Motion) {
+            b += 32;
+        }
+        let final_ch = if matches!(action, MouseAction::Release) {
+            'm'
+        } else {
+            'M'
+        };
+        format!("\x1b[<{b};{c};{r}{final_ch}").into_bytes()
+    } else {
+        // X10/normal: CSI M Cb Cx Cy, all byte-offset by 32. Release reports
+        // button 3; coordinates clamp at 255 (the legacy format's ceiling).
+        let mut b = match action {
+            MouseAction::Release => 3u32,
+            _ => button as u32,
+        };
+        if matches!(action, MouseAction::Motion) {
+            b += 32;
+        }
+        let cb = (b + 32).min(255) as u8;
+        let cx = (c + 32).min(255) as u8;
+        let cy = (r + 32).min(255) as u8;
+        vec![0x1b, b'[', b'M', cb, cx, cy]
+    };
+    let mut w = pane.writer.borrow_mut();
+    let _ = w.write_all(&seq);
+    let _ = w.flush();
 }
 
 fn pixel_to_cell(pane: &Pane, x: f64, y: f64) -> Option<(usize, usize)> {
@@ -1654,9 +2251,10 @@ fn apply_font_family_all(state: &Rc<WindowState>, new_path: PathBuf) {
 /// Swap the active color theme. `Cell` colors are palette references, so
 /// existing text re-tints on the next render.
 fn apply_theme(state: &Rc<WindowState>, theme: Theme) {
-    *state.theme.borrow_mut() = theme;
+    *state.theme.borrow_mut() = theme.clone();
     for tab in state.tabs.borrow().iter() {
         for pane in tab.panes.borrow().iter() {
+            *pane.theme.borrow_mut() = theme.clone();
             pane.gl_area.queue_render();
         }
     }
@@ -1690,6 +2288,9 @@ fn save_config(state: &Rc<WindowState>) {
         font_size,
         theme_name: Some(state.theme.borrow().name.clone()),
         scrollback_lines: scrollback,
+        cursor_blink: Some(state.cursor_blink.get()),
+        click_word_select: Some(state.click_word_select.get()),
+        copy_on_select: Some(state.copy_on_select.get()),
     };
     if let Err(e) = cfg.save(&path) {
         log::warn!("save config: {e}");
@@ -1698,9 +2299,53 @@ fn save_config(state: &Rc<WindowState>) {
 
 /// Open the Settings modal — Appearance / Theme / Behavior / Keybindings.
 /// Every control applies live and writes back to the config file.
+fn open_about(state: &Rc<WindowState>) {
+    use gtk4::{Align, Label, LinkButton};
+
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    const REPO: &str = env!("CARGO_PKG_REPOSITORY");
+
+    let dialog = gtk4::Window::new();
+    dialog.set_title(Some("About Skyterm"));
+    dialog.set_transient_for(Some(&state.window));
+    dialog.set_modal(true);
+    dialog.set_resizable(false);
+    dialog.set_default_size(320, -1);
+
+    let vbox = gtk4::Box::new(Orientation::Vertical, 16);
+    vbox.set_margin_top(32);
+    vbox.set_margin_bottom(32);
+    vbox.set_margin_start(32);
+    vbox.set_margin_end(32);
+    vbox.set_halign(Align::Center);
+
+    let name_label = Label::new(Some("Skyterm"));
+    name_label.add_css_class("title-1");
+    name_label.set_halign(Align::Center);
+
+    let version_label = Label::new(Some(&format!("Version {VERSION}")));
+    version_label.add_css_class("dim-label");
+    version_label.set_halign(Align::Center);
+
+    let desc_label = Label::new(Some("GPU-rendered terminal emulator"));
+    desc_label.set_halign(Align::Center);
+    desc_label.set_wrap(true);
+
+    let repo_btn = LinkButton::with_label(REPO, "GitHub Repository");
+    repo_btn.set_halign(Align::Center);
+
+    vbox.append(&name_label);
+    vbox.append(&version_label);
+    vbox.append(&desc_label);
+    vbox.append(&repo_btn);
+
+    dialog.set_child(Some(&vbox));
+    dialog.present();
+}
+
 fn open_settings(state: &Rc<WindowState>) {
-    use gtk4::{Align, Button, DropDown, Grid as GtkGrid, Label, ListBox, ScrolledWindow,
-        SpinButton, StringList};
+    use gtk4::{Align, Button, DropDown, Grid as GtkGrid, Label, ListBox, ListBoxRow,
+        ScrolledWindow, Separator, SpinButton, StringList};
 
     let dialog = gtk4::Window::new();
     dialog.set_title(Some("skyterm Settings"));
@@ -1783,28 +2428,84 @@ fn open_settings(state: &Rc<WindowState>) {
     theme_page.set_margin_top(20);
     theme_page.set_margin_bottom(20);
 
-    theme_page.attach(&row_label("Color theme"), 0, 0, 1, 1);
     let themes = state.available_themes.clone();
-    let theme_names: Vec<&str> = themes.iter().map(|t| t.name.as_str()).collect();
-    let theme_model = StringList::new(&theme_names);
-    let theme_dd = DropDown::new(Some(theme_model), gtk4::Expression::NONE);
-    theme_dd.set_hexpand(true);
     let current_theme_name = state.theme.borrow().name.clone();
-    if let Some(idx) = themes.iter().position(|t| t.name == current_theme_name) {
-        theme_dd.set_selected(idx as u32);
+
+    let theme_list = ListBox::new();
+    theme_list.set_selection_mode(gtk4::SelectionMode::Browse);
+
+    // Helper: append a non-selectable section header row.
+    let add_header = |list: &ListBox, text: &str| {
+        let row = ListBoxRow::new();
+        row.set_selectable(false);
+        row.set_activatable(false);
+        let lbl = Label::builder().label(text).xalign(0.0).build();
+        lbl.add_css_class("heading");
+        lbl.set_margin_start(6);
+        lbl.set_margin_top(6);
+        lbl.set_margin_bottom(2);
+        row.set_child(Some(&lbl));
+        list.append(&row);
+    };
+
+    let mut selected_row: Option<ListBoxRow> = None;
+    let mut first_light = true;
+
+    // Dark section header
+    add_header(&theme_list, "Dark");
+
+    for (idx, t) in themes.iter().enumerate() {
+        if !t.is_dark() {
+            // Insert separator + Light header before the first light theme
+            if first_light {
+                first_light = false;
+                let sep_row = ListBoxRow::new();
+                sep_row.set_selectable(false);
+                sep_row.set_activatable(false);
+                sep_row.set_child(Some(&Separator::new(Orientation::Horizontal)));
+                theme_list.append(&sep_row);
+                add_header(&theme_list, "Light");
+            }
+        }
+        let row = ListBoxRow::new();
+        row.set_widget_name(&idx.to_string());
+        let lbl = Label::builder().label(t.name.as_str()).xalign(0.0).build();
+        lbl.set_margin_start(14);
+        lbl.set_margin_top(4);
+        lbl.set_margin_bottom(4);
+        row.set_child(Some(&lbl));
+        if t.name == current_theme_name {
+            selected_row = Some(row.clone());
+        }
+        theme_list.append(&row);
     }
+
+    if let Some(r) = selected_row {
+        theme_list.select_row(Some(&r));
+    }
+
     {
         let state = state.clone();
         let themes = themes.clone();
-        theme_dd.connect_selected_notify(move |dd| {
-            let idx = dd.selected() as usize;
+        theme_list.connect_row_selected(move |_, row| {
+            let Some(row) = row else { return };
+            let Ok(idx) = row.widget_name().as_str().parse::<usize>() else { return };
             if let Some(t) = themes.get(idx) {
                 apply_theme(&state, t.clone());
                 save_config(&state);
             }
         });
     }
-    theme_page.attach(&theme_dd, 1, 0, 1, 1);
+
+    let theme_scroll = ScrolledWindow::builder()
+        .hexpand(true)
+        .min_content_height(180)
+        .max_content_height(240)
+        .build();
+    theme_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    theme_scroll.set_child(Some(&theme_list));
+
+    theme_page.attach(&theme_scroll, 0, 0, 2, 1);
 
     let theme_note = Label::builder()
         .label(
@@ -1828,7 +2529,31 @@ fn open_settings(state: &Rc<WindowState>) {
     behavior.set_margin_top(20);
     behavior.set_margin_bottom(20);
 
-    behavior.attach(&row_label("Scrollback lines"), 0, 0, 1, 1);
+    // Cursor blink toggle
+    behavior.attach(&row_label("Cursor blink"), 0, 0, 1, 1);
+    let blink_switch = gtk4::Switch::new();
+    blink_switch.set_active(state.cursor_blink.get());
+    blink_switch.set_halign(Align::Start);
+    {
+        let state = state.clone();
+        blink_switch.connect_active_notify(move |sw| {
+            let enabled = sw.is_active();
+            state.cursor_blink.set(enabled);
+            if !enabled {
+                // Cursor off → snap phase to visible so it stays shown.
+                state.blink_phase.set(true);
+            }
+            if let Some(tab) = current_tab(&state) {
+                for p in tab.panes.borrow().iter() {
+                    p.gl_area.queue_render();
+                }
+            }
+            save_config(&state);
+        });
+    }
+    behavior.attach(&blink_switch, 1, 0, 1, 1);
+
+    behavior.attach(&row_label("Scrollback lines"), 0, 1, 1, 1);
     let scrollback_spin = SpinButton::with_range(0.0, 1_000_000.0, 500.0);
     let current_sb = focused_pane(state)
         .map(|p| p.grid.borrow().scrollback_max() as f64)
@@ -1844,7 +2569,7 @@ fn open_settings(state: &Rc<WindowState>) {
             save_config(&state);
         });
     }
-    behavior.attach(&scrollback_spin, 1, 0, 1, 1);
+    behavior.attach(&scrollback_spin, 1, 1, 1, 1);
 
     let sb_note = Label::builder()
         .label("0 = infinite (no cap). Memory grows with terminal output.")
@@ -1852,7 +2577,41 @@ fn open_settings(state: &Rc<WindowState>) {
         .xalign(0.0)
         .build();
     sb_note.add_css_class("dim-label");
-    behavior.attach(&sb_note, 0, 1, 2, 1);
+    behavior.attach(&sb_note, 0, 2, 2, 1);
+
+    // Double-click word / triple-click line selection toggle.
+    behavior.attach(&row_label("Word/line click select"), 0, 3, 1, 1);
+    let word_switch = gtk4::Switch::new();
+    word_switch.set_active(state.click_word_select.get());
+    word_switch.set_halign(Align::Start);
+    word_switch.set_tooltip_text(Some(
+        "Double-click selects a word; triple-click selects the whole line.",
+    ));
+    {
+        let state = state.clone();
+        word_switch.connect_active_notify(move |sw| {
+            state.click_word_select.set(sw.is_active());
+            save_config(&state);
+        });
+    }
+    behavior.attach(&word_switch, 1, 3, 1, 1);
+
+    // Auto copy-on-select toggle.
+    behavior.attach(&row_label("Copy on select"), 0, 4, 1, 1);
+    let copy_switch = gtk4::Switch::new();
+    copy_switch.set_active(state.copy_on_select.get());
+    copy_switch.set_halign(Align::Start);
+    copy_switch.set_tooltip_text(Some(
+        "Automatically copy a selection to the clipboard as soon as you make it.",
+    ));
+    {
+        let state = state.clone();
+        copy_switch.connect_active_notify(move |sw| {
+            state.copy_on_select.set(sw.is_active());
+            save_config(&state);
+        });
+    }
+    behavior.attach(&copy_switch, 1, 4, 1, 1);
 
     notebook.append_page(&behavior, Some(&Label::new(Some("Behavior"))));
 

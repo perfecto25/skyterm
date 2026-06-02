@@ -22,6 +22,17 @@ pub struct Config {
     /// Maximum scrollback line count per pane.
     #[serde(default)]
     pub scrollback_lines: Option<usize>,
+    /// Whether the cursor blinks. `None` / absent means enabled.
+    #[serde(default)]
+    pub cursor_blink: Option<bool>,
+    /// Whether double-click selects a word and triple-click selects the whole
+    /// (wrapped) line. `None` / absent means enabled.
+    #[serde(default)]
+    pub click_word_select: Option<bool>,
+    /// Whether making a selection (word, line, or drag) copies it to the system
+    /// clipboard automatically. `None` / absent means disabled.
+    #[serde(default)]
+    pub copy_on_select: Option<bool>,
 }
 
 impl Config {

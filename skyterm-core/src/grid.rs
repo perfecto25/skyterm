@@ -1,8 +1,38 @@
 use std::collections::VecDeque;
+use std::ops::{Deref, DerefMut, Index, IndexMut};
 
 use crate::theme::CellColor;
 
 const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
+
+/// Which mouse-reporting protocol the foreground app has enabled.
+///
+/// Scroll events are forwarded to the PTY when any mode other than `None` is
+/// active, encoded as button 64 (up) / 65 (down).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseMode {
+    /// No mouse reporting — scroll wheel drives scrollback.
+    #[default]
+    None,
+    /// ?1000 — report button press/release only.
+    Normal,
+    /// ?1002 — report press/release + motion while a button is held.
+    ButtonMotion,
+    /// ?1003 — report all motion events.
+    AnyMotion,
+}
+
+/// Terminal cursor shape, set by DECSCUSR (`CSI Ps SP q`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    /// Filled block covering the full cell (modes 0, 1, 2). Default.
+    #[default]
+    Block,
+    /// Thin horizontal bar at the bottom of the cell (modes 3, 4).
+    Underline,
+    /// Thin vertical bar at the left edge of the cell (modes 5, 6).
+    Bar,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
@@ -25,6 +55,59 @@ impl Default for Cell {
     }
 }
 
+/// One row of cells plus a `wrapped` flag recording *why* the line ended.
+///
+/// `wrapped == true` means the text ran off the right edge and auto-wrapped
+/// onto the next row — a "soft" break with no real newline in the byte stream.
+/// `false` means the row was terminated by an explicit newline (or never
+/// filled). On resize we rejoin soft-wrapped runs into logical lines and
+/// re-split them at the new width, so already-printed output reflows the way
+/// VTE-based terminals (gnome-terminal, Terminator) do.
+///
+/// `Deref`/`Index` to the inner `Vec<Cell>` keep every existing `row[col]` and
+/// `row.len()` call site working unchanged; the flag rides along automatically
+/// through `remove`/`insert`/`push_back`, so it can't desync from its cells.
+#[derive(Clone)]
+pub(crate) struct Row {
+    cells: Vec<Cell>,
+    wrapped: bool,
+}
+
+impl Row {
+    fn blank(len: usize, cell: Cell) -> Row {
+        Row {
+            cells: vec![cell; len],
+            wrapped: false,
+        }
+    }
+}
+
+impl Deref for Row {
+    type Target = Vec<Cell>;
+    fn deref(&self) -> &Vec<Cell> {
+        &self.cells
+    }
+}
+
+impl DerefMut for Row {
+    fn deref_mut(&mut self) -> &mut Vec<Cell> {
+        &mut self.cells
+    }
+}
+
+impl Index<usize> for Row {
+    type Output = Cell;
+    fn index(&self, i: usize) -> &Cell {
+        &self.cells[i]
+    }
+}
+
+impl IndexMut<usize> for Row {
+    fn index_mut(&mut self, i: usize) -> &mut Cell {
+        &mut self.cells[i]
+    }
+}
+
 /// Fixed-size character grid with a wrapping cursor and current-SGR state.
 ///
 /// M2 scope so far: cursor placement, erase, insert/delete chars, scroll
@@ -33,7 +116,7 @@ impl Default for Cell {
 pub struct Grid {
     cols: usize,
     rows: usize,
-    cells: Vec<Vec<Cell>>,
+    cells: Vec<Row>,
     cursor_row: usize,
     cursor_col: usize,
     current_fg: CellColor,
@@ -41,11 +124,12 @@ pub struct Grid {
     bold: bool,
     reverse: bool,
     cursor_visible: bool,
+    cursor_shape: CursorShape,
     saved: Option<SavedCursor>,
     /// When `Some`, the live screen is the alt screen and the saved main
     /// screen state lives here, waiting to be restored on exit.
     alt: Option<AltScreenSave>,
-    scrollback: VecDeque<Vec<Cell>>,
+    scrollback: VecDeque<Row>,
     scrollback_max: usize,
     /// 0 = viewing live screen at bottom. N>0 = scrolled up N lines into
     /// scrollback. Clamped to scrollback.len() on set.
@@ -57,6 +141,16 @@ pub struct Grid {
     /// list under a pinned header) are transient.
     scroll_top: usize,
     scroll_bottom: usize,
+    /// Which mouse-reporting mode is active (set by ?1000/1002/1003 h/l).
+    pub mouse_mode: MouseMode,
+    /// Whether the SGR mouse extension (?1006) is active. When true, scroll
+    /// events are encoded as `CSI < 64 ; col ; row M` instead of raw bytes.
+    pub mouse_sgr: bool,
+    /// DECCKM (?1). When set, the cursor/arrow keys transmit in *application*
+    /// mode (`ESC O A` …) instead of normal mode (`ESC [ A` …). ncurses apps
+    /// (htop, less, vim) enable this via `keypad()` and won't recognise arrows
+    /// sent in the wrong mode.
+    pub app_cursor_keys: bool,
     dirty: u64,
 }
 
@@ -71,7 +165,7 @@ struct SavedCursor {
 }
 
 struct AltScreenSave {
-    cells: Vec<Vec<Cell>>,
+    cells: Vec<Row>,
     cursor_row: usize,
     cursor_col: usize,
     fg: CellColor,
@@ -85,7 +179,7 @@ struct AltScreenSave {
 
 impl Grid {
     pub fn new(cols: usize, rows: usize) -> Self {
-        let cells = vec![vec![Cell::EMPTY; cols]; rows];
+        let cells = (0..rows).map(|_| Row::blank(cols, Cell::EMPTY)).collect();
         Self {
             cols,
             rows,
@@ -97,11 +191,15 @@ impl Grid {
             bold: false,
             reverse: false,
             cursor_visible: true,
+            cursor_shape: CursorShape::default(),
             saved: None,
             alt: None,
             scrollback: VecDeque::new(),
             scrollback_max: DEFAULT_SCROLLBACK_LINES,
             view_offset: 0,
+            mouse_mode: MouseMode::default(),
+            mouse_sgr: false,
+            app_cursor_keys: false,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             dirty: 1,
@@ -140,6 +238,14 @@ impl Grid {
 
     pub fn cursor_visible(&self) -> bool {
         self.cursor_visible
+    }
+
+    pub fn cursor_shape(&self) -> CursorShape {
+        self.cursor_shape
+    }
+
+    pub fn set_cursor_shape(&mut self, shape: CursorShape) {
+        self.cursor_shape = shape;
     }
 
     pub fn set_cursor_visible(&mut self, v: bool) {
@@ -182,8 +288,9 @@ impl Grid {
         if self.alt.is_some() {
             return;
         }
-        let blank = Cell::EMPTY;
-        let fresh = vec![vec![blank; self.cols]; self.rows];
+        let fresh = (0..self.rows)
+            .map(|_| Row::blank(self.cols, Cell::EMPTY))
+            .collect();
         let saved_cells = std::mem::replace(&mut self.cells, fresh);
         self.alt = Some(AltScreenSave {
             cells: saved_cells,
@@ -214,7 +321,7 @@ impl Grid {
             // current dimensions, reshape them with blank padding/truncation.
             let mut cells = save.cells;
             if cells.len() != self.rows {
-                cells.resize_with(self.rows, || vec![Cell::EMPTY; self.cols]);
+                cells.resize_with(self.rows, || Row::blank(self.cols, Cell::EMPTY));
             }
             for row in &mut cells {
                 row.resize(self.cols, Cell::EMPTY);
@@ -294,6 +401,20 @@ impl Grid {
         }
     }
 
+    /// Whether the view row at `view_row` ends in a soft (auto) wrap — i.e. its
+    /// text continues on the next row. Used to select / copy a whole logical
+    /// line across its wrapped continuation rows.
+    pub fn visible_row_wrapped(&self, view_row: usize) -> bool {
+        let sb_len = self.scrollback.len();
+        let logical = sb_len.saturating_sub(self.view_offset) + view_row;
+        if logical < sb_len {
+            self.scrollback[logical].wrapped
+        } else {
+            let r = logical - sb_len;
+            r < self.rows && self.cells[r].wrapped
+        }
+    }
+
     /// View-relative cursor position. None if cursor is scrolled out of view.
     pub fn visible_cursor(&self) -> Option<(usize, usize)> {
         let view_row = self.cursor_row + self.view_offset;
@@ -321,7 +442,7 @@ impl Grid {
     }
 
     pub fn row(&self, row: usize) -> &[Cell] {
-        &self.cells[row]
+        &self.cells[row].cells
     }
 
     pub fn dirty_counter(&self) -> u64 {
@@ -363,10 +484,33 @@ impl Grid {
         if cols == self.cols && rows == self.rows {
             return;
         }
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        // Alt screen (vim, htop, …) is a full-screen TUI that repaints itself
+        // on SIGWINCH, so reflowing it is pointless and would fight the app.
+        // Just pad/truncate it (and the saved main buffer underneath). The main
+        // scrollback is left untouched; it reflows when we're back on it.
+        if self.alt.is_some() {
+            self.resize_simple(cols, rows);
+            return;
+        }
+        self.reflow(cols, rows);
+    }
+
+    /// Pad/truncate every row to the new geometry without rejoining wrapped
+    /// lines. Used for the alt screen, where reflow is undesirable.
+    fn resize_simple(&mut self, cols: usize, rows: usize) {
         let blank = self.blank_cell();
-        self.cells.resize_with(rows, || vec![blank; cols]);
+        self.cells.resize_with(rows, || Row::blank(cols, blank));
         for line in &mut self.cells {
             line.resize(cols, blank);
+        }
+        if let Some(alt) = self.alt.as_mut() {
+            alt.cells.resize_with(rows, || Row::blank(cols, Cell::EMPTY));
+            for line in &mut alt.cells {
+                line.resize(cols, Cell::EMPTY);
+            }
         }
         self.cols = cols;
         self.rows = rows;
@@ -377,9 +521,151 @@ impl Grid {
         self.bump_dirty();
     }
 
+    /// Rejoin soft-wrapped runs into logical lines, then re-split them at the
+    /// new column count — the reflow that VTE-based terminals do. The cursor's
+    /// absolute position in the text is preserved, and the view snaps to the
+    /// live bottom.
+    fn reflow(&mut self, cols: usize, rows: usize) {
+        // 1. Flatten scrollback + the in-use part of the screen into one stream
+        //    of (row, is_cursor_row) entries. Rows below the cursor / last
+        //    non-blank row are trailing padding we don't want to preserve as
+        //    content — they'd otherwise pin the prompt to the top after a grow.
+        let last_nonblank = self
+            .cells
+            .iter()
+            .rposition(|r| r.iter().any(|c| *c != Cell::EMPTY));
+        let content_rows = last_nonblank
+            .map(|i| i + 1)
+            .unwrap_or(0)
+            .max(self.cursor_row + 1);
+
+        // Cursor's absolute cell offset, tracked as (logical line, column).
+        let cursor_stream_row = self.scrollback.len() + self.cursor_row;
+
+        // 2. Build logical lines. A run of rows joined by `wrapped` flags is one
+        //    logical line; we concatenate their cells (full width for wrapped
+        //    segments, trailing blanks trimmed only on the terminating row).
+        struct Logical {
+            cells: Vec<Cell>,
+            // Cursor offset within this logical line, if the cursor sits here.
+            cursor_col: Option<usize>,
+        }
+        let mut logicals: Vec<Logical> = Vec::new();
+        let mut cur: Vec<Cell> = Vec::new();
+        let mut cur_cursor: Option<usize> = None;
+
+        let stream = self
+            .scrollback
+            .iter()
+            .chain(self.cells.iter().take(content_rows));
+
+        for (stream_row, row) in stream.enumerate() {
+            if stream_row == cursor_stream_row {
+                cur_cursor = Some(cur.len() + self.cursor_col.min(row.len()));
+            }
+            if row.wrapped {
+                // Soft wrap: the whole row is content; the line continues.
+                cur.extend_from_slice(&row.cells);
+            } else {
+                // Hard break: trim trailing blanks, emit the logical line.
+                let mut end = row.cells.len();
+                while end > 0 && row.cells[end - 1] == Cell::EMPTY {
+                    end -= 1;
+                }
+                cur.extend_from_slice(&row.cells[..end]);
+                logicals.push(Logical {
+                    cells: std::mem::take(&mut cur),
+                    cursor_col: cur_cursor.take(),
+                });
+            }
+        }
+        // The cursor row may be a `wrapped` row whose run hasn't been closed by
+        // a hard break (mid-wrap cursor); flush whatever's pending.
+        if !cur.is_empty() || cur_cursor.is_some() {
+            logicals.push(Logical {
+                cells: cur,
+                cursor_col: cur_cursor.take(),
+            });
+        }
+
+        // 3. Re-split each logical line into rows of `cols`. Every chunk but the
+        //    last gets wrapped=true. Empty logical lines stay one blank row.
+        let blank = Cell::EMPTY;
+        let mut out: Vec<Row> = Vec::new();
+        let mut new_cursor_abs: Option<(usize, usize)> = None; // (row index, col)
+        for lg in logicals {
+            let first_out_row = out.len();
+            if lg.cells.is_empty() {
+                if lg.cursor_col.is_some() {
+                    new_cursor_abs = Some((out.len(), 0));
+                }
+                out.push(Row::blank(cols, blank));
+                continue;
+            }
+            let mut chunks = lg.cells.chunks(cols).peekable();
+            while let Some(chunk) = chunks.next() {
+                let mut cells = chunk.to_vec();
+                cells.resize(cols, blank);
+                let wrapped = chunks.peek().is_some();
+                out.push(Row {
+                    cells,
+                    wrapped,
+                });
+            }
+            if let Some(off) = lg.cursor_col {
+                let r = first_out_row + off / cols;
+                let c = (off % cols).min(cols.saturating_sub(1));
+                new_cursor_abs = Some((r, c));
+            }
+        }
+        if out.is_empty() {
+            out.push(Row::blank(cols, blank));
+        }
+
+        // 4. The bottom `rows` rows become the live screen; everything above
+        //    flows into scrollback. The cursor sits at the content end (it was
+        //    the last row included), so the bottom window always contains it.
+        //    Pad below with blanks when the content is shorter than the screen.
+        let (cur_abs_row, cur_abs_col) =
+            new_cursor_abs.unwrap_or((out.len().saturating_sub(1), 0));
+
+        let screen_start = out.len().saturating_sub(rows);
+        let mut new_cells: Vec<Row> = out.split_off(screen_start);
+        let new_scrollback: VecDeque<Row> = VecDeque::from(out);
+        while new_cells.len() < rows {
+            new_cells.push(Row::blank(cols, blank));
+        }
+
+        // Trim scrollback to its bound.
+        let mut new_scrollback = new_scrollback;
+        if self.scrollback_max != 0 {
+            while new_scrollback.len() > self.scrollback_max {
+                new_scrollback.pop_front();
+            }
+        }
+
+        self.cells = new_cells;
+        self.scrollback = new_scrollback;
+        self.cols = cols;
+        self.rows = rows;
+        self.cursor_row = cur_abs_row.saturating_sub(screen_start).min(rows - 1);
+        self.cursor_col = cur_abs_col.min(cols - 1);
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
+        self.view_offset = 0;
+        self.saved = None;
+        self.bump_dirty();
+    }
+
     /// Place a printable char at the cursor and advance.
     pub fn put_char(&mut self, ch: char) {
         if self.cursor_col >= self.cols {
+            // We filled the last column and another glyph arrived: this row
+            // continues onto the next via auto-wrap. Tag it so resize can
+            // rejoin the two halves into one logical line. (An explicit
+            // newline instead would reach `linefeed` directly, leaving the
+            // flag false — that's the soft-vs-hard distinction reflow needs.)
+            self.cells[self.cursor_row].wrapped = true;
             self.linefeed();
             self.cursor_col = 0;
         }
@@ -406,14 +692,14 @@ impl Grid {
                 self.push_scrollback(displaced);
             }
             self.cells
-                .insert(self.scroll_bottom, vec![blank; self.cols]);
+                .insert(self.scroll_bottom, Row::blank(self.cols, blank));
         } else if self.cursor_row + 1 < self.rows {
             self.cursor_row += 1;
         }
         self.bump_dirty();
     }
 
-    fn push_scrollback(&mut self, line: Vec<Cell>) {
+    fn push_scrollback(&mut self, line: Row) {
         // Alt screen content (vim, htop, less) is transient — don't pollute
         // the main scrollback with it.
         if self.alt.is_some() {
@@ -607,7 +893,7 @@ impl Grid {
                 self.push_scrollback(displaced);
             }
             self.cells
-                .insert(self.scroll_bottom, vec![blank; self.cols]);
+                .insert(self.scroll_bottom, Row::blank(self.cols, blank));
         }
         self.bump_dirty();
     }
@@ -619,7 +905,7 @@ impl Grid {
         for _ in 0..n {
             self.cells.remove(self.scroll_bottom);
             self.cells
-                .insert(self.scroll_top, vec![blank; self.cols]);
+                .insert(self.scroll_top, Row::blank(self.cols, blank));
         }
         self.bump_dirty();
     }
@@ -636,7 +922,7 @@ impl Grid {
         let blank = self.blank_cell();
         for _ in 0..n {
             self.cells.remove(self.scroll_bottom);
-            self.cells.insert(row, vec![blank; self.cols]);
+            self.cells.insert(row, Row::blank(self.cols, blank));
         }
         self.bump_dirty();
     }
@@ -654,7 +940,7 @@ impl Grid {
         for _ in 0..n {
             self.cells.remove(row);
             self.cells
-                .insert(self.scroll_bottom, vec![blank; self.cols]);
+                .insert(self.scroll_bottom, Row::blank(self.cols, blank));
         }
         self.bump_dirty();
     }
@@ -876,5 +1162,92 @@ mod tests {
         g.delete_chars(2);
         let s: String = g.row(0).iter().map(|c| c.ch).collect();
         assert_eq!(s, "adef  ");
+    }
+
+    // ── reflow on resize ──────────────────────────────────────────────────
+
+    fn type_str(g: &mut Grid, s: &str) {
+        for ch in s.chars() {
+            if ch == '\n' {
+                g.linefeed();
+                g.carriage_return();
+            } else {
+                g.put_char(ch);
+            }
+        }
+    }
+
+    fn row_str(g: &Grid, r: usize) -> String {
+        g.row(r)
+            .iter()
+            .map(|c| c.ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn reflow_widening_rejoins_wrapped_line() {
+        let mut g = Grid::new(10, 4);
+        type_str(&mut g, "HELLOWORLD12");
+        // Auto-wrapped at the 10-col edge.
+        assert_eq!(row_str(&g, 0), "HELLOWORLD");
+        assert_eq!(row_str(&g, 1), "12");
+
+        g.resize(20, 4);
+        // The two halves rejoin into one logical line at the wider width.
+        assert_eq!(row_str(&g, 0), "HELLOWORLD12");
+        assert_eq!(row_str(&g, 1), "");
+        // Cursor stays attached to the same text position.
+        assert_eq!(g.cursor(), (0, 12));
+    }
+
+    #[test]
+    fn reflow_narrowing_splits_line() {
+        let mut g = Grid::new(20, 4);
+        type_str(&mut g, "HELLOWORLD12");
+        assert_eq!(row_str(&g, 0), "HELLOWORLD12");
+
+        g.resize(4, 4);
+        assert_eq!(row_str(&g, 0), "HELL");
+        assert_eq!(row_str(&g, 1), "OWOR");
+        assert_eq!(row_str(&g, 2), "LD12");
+    }
+
+    #[test]
+    fn reflow_preserves_hard_newlines() {
+        let mut g = Grid::new(10, 5);
+        type_str(&mut g, "line one\nline two");
+        g.resize(40, 5);
+        // A real newline must NOT be rejoined into the previous line.
+        assert_eq!(row_str(&g, 0), "line one");
+        assert_eq!(row_str(&g, 1), "line two");
+    }
+
+    #[test]
+    fn reflow_rejoins_across_scrollback_boundary() {
+        // A single 12-char auto-wrapped line, half scrolled into history.
+        let mut g = Grid::new(4, 2);
+        type_str(&mut g, "ABCDEFGHIJKL");
+        assert_eq!(g.scrollback_len(), 1); // "ABCD" scrolled off
+        assert_eq!(row_str(&g, 0), "EFGH");
+        assert_eq!(row_str(&g, 1), "IJKL");
+
+        g.resize(12, 4);
+        // Widening pulls the whole logical line back onto one screen row.
+        assert_eq!(g.scrollback_len(), 0);
+        assert_eq!(row_str(&g, 0), "ABCDEFGHIJKL");
+    }
+
+    #[test]
+    fn reflow_in_alt_screen_does_not_rejoin() {
+        let mut g = Grid::new(4, 3);
+        g.enter_alt_screen();
+        type_str(&mut g, "ABCDEF"); // wraps within the alt screen
+        // Alt screen is pad/truncate only — resizing must not panic or reflow.
+        g.resize(8, 3);
+        assert_eq!(g.cols(), 8);
+        assert_eq!(g.rows(), 3);
+        assert!(g.is_alt_screen());
     }
 }

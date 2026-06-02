@@ -5,6 +5,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use freetype::face::LoadFlag;
 
+/// JetBrains Mono Regular baked into the binary — always available.
+static EMBEDDED_FONT_BYTES: &[u8] =
+    include_bytes!("../resources/JetBrainsMono-Regular.ttf");
+
+/// Sentinel path returned by [`locate_monospace_font`] to signal "use the
+/// embedded font" without changing any of the PathBuf-based wiring in app.rs.
+pub const EMBEDDED_FONT_PATH: &str = ":embedded:JetBrainsMono-Regular:";
+
 /// 2D R8 glyph atlas. `locations` maps each known codepoint to its slot
 /// index; the renderer derives the UV rect from `slot_x = i % glyphs_per_row`
 /// and `slot_y = i / glyphs_per_row`.
@@ -74,11 +82,8 @@ pub fn available_monospace_fonts() -> Vec<(String, PathBuf)> {
 }
 
 pub fn locate_monospace_font() -> Result<PathBuf> {
-    available_monospace_fonts()
-        .into_iter()
-        .next()
-        .map(|(_, p)| p)
-        .ok_or_else(|| anyhow!("no monospace font found in standard locations"))
+    // Embedded JetBrains Mono is always the default; never fails.
+    Ok(PathBuf::from(EMBEDDED_FONT_PATH))
 }
 
 pub fn build_atlas(font_path: &Path, size_px: u32) -> Result<Atlas> {
@@ -91,9 +96,13 @@ pub fn build_atlas_with_ranges(
     ranges: &[RangeInclusive<u32>],
 ) -> Result<Atlas> {
     let lib = freetype::Library::init().context("freetype init")?;
-    let face = lib
-        .new_face(font_path, 0)
-        .with_context(|| format!("opening font {}", font_path.display()))?;
+    let face = if font_path.to_str() == Some(EMBEDDED_FONT_PATH) {
+        lib.new_memory_face(EMBEDDED_FONT_BYTES.to_vec(), 0)
+            .context("loading embedded JetBrains Mono")?
+    } else {
+        lib.new_face(font_path, 0)
+            .with_context(|| format!("opening font {}", font_path.display()))?
+    };
     face.set_pixel_sizes(0, size_px)
         .context("set_pixel_sizes")?;
 
@@ -131,7 +140,8 @@ pub fn build_atlas_with_ranges(
     let rows_in_atlas = total.div_ceil(cols);
     let width = cols * cell_w;
     let height = rows_in_atlas * cell_h;
-    let mut pixels = vec![0u8; (width as usize) * (height as usize)];
+    // 3 bytes per texel — RGB LCD sub-pixel coverage (R, G, B channels).
+    let mut pixels = vec![0u8; (width as usize) * (height as usize) * 3];
 
     let mut locations: HashMap<u32, u32> = HashMap::with_capacity(codepoints.len());
     let mut fallback_slot: u32 = 0;
@@ -142,15 +152,18 @@ pub fn build_atlas_with_ranges(
             fallback_slot = slot;
         }
         locations.insert(cp, slot);
+        // TARGET_LCD: FreeType renders R/G/B sub-pixel coverage. The resulting
+        // bitmap.width() is 3× the pixel column count.
         if face
-            .load_char(cp as usize, LoadFlag::RENDER)
+            .load_char(cp as usize, LoadFlag::TARGET_LCD | LoadFlag::RENDER)
             .is_err()
         {
             continue;
         }
         let glyph = face.glyph();
         let bitmap = glyph.bitmap();
-        let bm_w = bitmap.width();
+        let bm_byte_w = bitmap.width(); // bytes per row = 3 × pixel columns
+        let bm_px_w = bm_byte_w / 3;   // actual pixel columns
         let bm_h = bitmap.rows();
         let pitch = bitmap.pitch().abs() as usize;
         let buf = bitmap.buffer();
@@ -168,21 +181,19 @@ pub fn build_atlas_with_ranges(
 
         for y in 0..bm_h {
             let dst_y = cell_origin_y + y;
-            // Clamp to THIS slot's vertical span — otherwise tall block-element
-            // glyphs (▀▄█) bleed into the slot directly below in the atlas.
             if dst_y < cell_top || dst_y >= cell_bottom {
                 continue;
             }
-            for x in 0..bm_w {
-                let dst_x = cell_origin_x + x;
-                // Same for horizontal — wide glyphs would otherwise leak into
-                // the neighbouring column slot.
+            for x_px in 0..bm_px_w {
+                let dst_x = cell_origin_x + x_px;
                 if dst_x < cell_left || dst_x >= cell_right {
                     continue;
                 }
-                let src_idx = (y as usize) * pitch + (x as usize);
-                let dst_idx = (dst_y as usize) * (width as usize) + (dst_x as usize);
-                pixels[dst_idx] = buf[src_idx];
+                let src = (y as usize) * pitch + (x_px as usize) * 3;
+                let dst = ((dst_y as usize) * (width as usize) + (dst_x as usize)) * 3;
+                pixels[dst]     = buf[src];
+                pixels[dst + 1] = buf[src + 1];
+                pixels[dst + 2] = buf[src + 2];
             }
         }
     }

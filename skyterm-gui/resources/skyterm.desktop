@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Skyterm
+Comment=GPU-rendered terminal emulator
+Exec=skyterm
+Icon=skyterm
+Terminal=false
+Type=Application
+Categories=System;TerminalEmulator;
+StartupNotify=true

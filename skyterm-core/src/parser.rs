@@ -1,4 +1,4 @@
-use crate::grid::Grid;
+use crate::grid::{CursorShape, Grid, MouseMode};
 use crate::theme::{CellColor, Color};
 
 /// Wraps `vte::Parser` and drives a `Grid`. Buffers any responses the terminal
@@ -169,6 +169,7 @@ impl<'a> Performer<'a> {
         for p in params.iter() {
             let Some(&code) = p.first() else { continue };
             match code {
+                1 => self.grid.app_cursor_keys = set,
                 25 => self.grid.set_cursor_visible(set),
                 47 | 1047 => {
                     if set {
@@ -194,9 +195,24 @@ impl<'a> Performer<'a> {
                     }
                 }
                 2004 => *self.bracketed_paste = set,
+                // Mouse reporting modes — mutually exclusive; enabling one
+                // clears the others. Disabling any turns reporting off.
+                1000 => {
+                    self.grid.mouse_mode =
+                        if set { MouseMode::Normal } else { MouseMode::None };
+                }
+                1002 => {
+                    self.grid.mouse_mode =
+                        if set { MouseMode::ButtonMotion } else { MouseMode::None };
+                }
+                1003 => {
+                    self.grid.mouse_mode =
+                        if set { MouseMode::AnyMotion } else { MouseMode::None };
+                }
+                // SGR mouse encoding (?1006) — extends coordinate range beyond 223.
+                1006 => self.grid.mouse_sgr = set,
                 _ => {
-                    // Many other modes exist (?7 autowrap, ?1000 mouse, …).
-                    // Wired in later as needed.
+                    // Many other modes exist (?7 autowrap, etc.).
                 }
             }
         }
@@ -328,6 +344,17 @@ impl<'a> vte::Perform for Performer<'a> {
             'c' => {
                 // Primary device attributes — claim VT100 + advanced video.
                 self.responses.extend_from_slice(b"\x1b[?1;2c");
+            }
+            // DECSCUSR — set cursor style. Intermediate byte 0x20 (SP) + 'q'.
+            // 0/1/2 = block, 3/4 = underline, 5/6 = bar (ibeam).
+            'q' if intermediates.first() == Some(&b' ') => {
+                let shape = match first.unwrap_or(0) {
+                    0 | 1 | 2 => CursorShape::Block,
+                    3 | 4     => CursorShape::Underline,
+                    5 | 6     => CursorShape::Bar,
+                    _         => CursorShape::Block,
+                };
+                self.grid.set_cursor_shape(shape);
             }
             _ => {}
         }
@@ -465,6 +492,30 @@ mod tests {
         p.advance(&mut g, b"\x1b[?1049l");
         assert!(!g.is_alt_screen());
         assert_eq!(g.row(0).iter().map(|c| c.ch).collect::<String>(), "main");
+    }
+
+    #[test]
+    fn decckm_toggles_app_cursor_keys() {
+        let mut g = Grid::new(4, 1);
+        let mut p = Parser::new();
+        assert!(!g.app_cursor_keys);
+        p.advance(&mut g, b"\x1b[?1h");
+        assert!(g.app_cursor_keys);
+        p.advance(&mut g, b"\x1b[?1l");
+        assert!(!g.app_cursor_keys);
+    }
+
+    #[test]
+    fn mouse_modes_and_sgr_toggle() {
+        let mut g = Grid::new(4, 1);
+        let mut p = Parser::new();
+        p.advance(&mut g, b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(g.mouse_mode, MouseMode::Normal);
+        assert!(g.mouse_sgr);
+        p.advance(&mut g, b"\x1b[?1002h");
+        assert_eq!(g.mouse_mode, MouseMode::ButtonMotion);
+        p.advance(&mut g, b"\x1b[?1000l");
+        assert_eq!(g.mouse_mode, MouseMode::None);
     }
 
     #[test]

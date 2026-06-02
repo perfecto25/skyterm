@@ -189,14 +189,285 @@ impl Theme {
         }
     }
 
-    /// All built-in presets, in the order they appear in the Settings UI.
+    /// Built-in theme: Dracula by Zeno Rocha.
+    pub fn skyterm_dracula() -> Self {
+        let ansi: [Color; 16] = [
+            Color::rgb(0x21, 0x22, 0x2c), // black
+            Color::rgb(0xff, 0x55, 0x55), // red
+            Color::rgb(0x50, 0xfa, 0x7b), // green
+            Color::rgb(0xf1, 0xfa, 0x8c), // yellow
+            Color::rgb(0xbd, 0x93, 0xf9), // blue (violet)
+            Color::rgb(0xff, 0x79, 0xc6), // magenta
+            Color::rgb(0x8b, 0xe9, 0xfd), // cyan
+            Color::rgb(0xf8, 0xf8, 0xf2), // white
+            Color::rgb(0x62, 0x72, 0xa4), // bright black
+            Color::rgb(0xff, 0x6e, 0x6e), // bright red
+            Color::rgb(0x69, 0xff, 0x94), // bright green
+            Color::rgb(0xff, 0xff, 0xa5), // bright yellow
+            Color::rgb(0xd6, 0xac, 0xff), // bright blue
+            Color::rgb(0xff, 0x92, 0xdf), // bright magenta
+            Color::rgb(0xa4, 0xff, 0xff), // bright cyan
+            Color::rgb(0xff, 0xff, 0xff), // bright white
+        ];
+        let mut palette = [Color::rgb(0, 0, 0); 256];
+        for (i, c) in ansi.iter().enumerate() { palette[i] = *c; }
+        for i in 16..256u16 { palette[i as usize] = Color::xterm_256(i as u8); }
+        Self {
+            name: "Skyterm Dracula".into(),
+            fg: Color::rgb(0xf8, 0xf8, 0xf2),
+            bg: Color::rgb(0x28, 0x2a, 0x36),
+            cursor: Color::rgb(0xf8, 0xf8, 0xf2),
+            palette,
+        }
+    }
+
+    /// Built-in theme: deep purple aesthetic.
+    pub fn skyterm_purple() -> Self {
+        let ansi: [Color; 16] = [
+            Color::rgb(0x15, 0x08, 0x26), // black
+            Color::rgb(0xff, 0x33, 0x66), // red
+            Color::rgb(0x5a, 0xf7, 0x8e), // green
+            Color::rgb(0xf3, 0xf9, 0x9d), // yellow
+            Color::rgb(0x57, 0xc7, 0xff), // blue
+            Color::rgb(0xff, 0x6a, 0xc1), // magenta
+            Color::rgb(0x9a, 0xed, 0xfe), // cyan
+            Color::rgb(0xd1, 0xc4, 0xe9), // white
+            Color::rgb(0x4a, 0x35, 0x60), // bright black
+            Color::rgb(0xff, 0x6b, 0x6b), // bright red
+            Color::rgb(0x69, 0xff, 0x94), // bright green
+            Color::rgb(0xff, 0xff, 0xa5), // bright yellow
+            Color::rgb(0xa2, 0x9b, 0xfe), // bright blue
+            Color::rgb(0xfd, 0x79, 0xa8), // bright magenta
+            Color::rgb(0x74, 0xb9, 0xff), // bright cyan
+            Color::rgb(0xff, 0xff, 0xff), // bright white
+        ];
+        let mut palette = [Color::rgb(0, 0, 0); 256];
+        for (i, c) in ansi.iter().enumerate() { palette[i] = *c; }
+        for i in 16..256u16 { palette[i as usize] = Color::xterm_256(i as u8); }
+        Self {
+            name: "Skyterm Purple".into(),
+            fg: Color::rgb(0xe0, 0xd0, 0xff),
+            bg: Color::rgb(0x1a, 0x0d, 0x2e),
+            cursor: Color::rgb(0xbf, 0x9f, 0xff),
+            palette,
+        }
+    }
+
+    /// Built-in theme: Atom One Light.
+    pub fn skyterm_atom() -> Self {
+        let ansi: [Color; 16] = [
+            Color::rgb(0x38, 0x3a, 0x42), // black
+            Color::rgb(0xe4, 0x56, 0x49), // red
+            Color::rgb(0x50, 0xa1, 0x4f), // green
+            Color::rgb(0xc1, 0x84, 0x01), // yellow
+            Color::rgb(0x40, 0x78, 0xf2), // blue
+            Color::rgb(0xa6, 0x26, 0xa4), // magenta
+            Color::rgb(0x01, 0x84, 0xbc), // cyan
+            Color::rgb(0xa0, 0xa1, 0xa7), // white
+            Color::rgb(0x69, 0x6c, 0x77), // bright black
+            Color::rgb(0xe4, 0x56, 0x49), // bright red
+            Color::rgb(0x50, 0xa1, 0x4f), // bright green
+            Color::rgb(0xc1, 0x84, 0x01), // bright yellow
+            Color::rgb(0x40, 0x78, 0xf2), // bright blue
+            Color::rgb(0xa6, 0x26, 0xa4), // bright magenta
+            Color::rgb(0x01, 0x84, 0xbc), // bright cyan
+            Color::rgb(0xff, 0xff, 0xff), // bright white
+        ];
+        let mut palette = [Color::rgb(0, 0, 0); 256];
+        for (i, c) in ansi.iter().enumerate() { palette[i] = *c; }
+        for i in 16..256u16 { palette[i as usize] = Color::xterm_256(i as u8); }
+        Self {
+            name: "Skyterm Atom".into(),
+            fg: Color::rgb(0x38, 0x3a, 0x42),
+            bg: Color::rgb(0xfa, 0xfa, 0xfa),
+            cursor: Color::rgb(0x52, 0x6f, 0xff),
+            palette,
+        }
+    }
+
+    /// Built-in theme: neutral gray — muted, low-contrast palette for low-glare environments.
+    pub fn skyterm_gray() -> Self {
+        let ansi: [Color; 16] = [
+            Color::rgb(0x1e, 0x1e, 0x1e), // black
+            Color::rgb(0xc0, 0x39, 0x2b), // red
+            Color::rgb(0x27, 0xae, 0x60), // green
+            Color::rgb(0xd4, 0x88, 0x0e), // yellow (amber)
+            Color::rgb(0x29, 0x80, 0xb9), // blue
+            Color::rgb(0x8e, 0x44, 0xad), // magenta
+            Color::rgb(0x16, 0xa0, 0x85), // cyan
+            Color::rgb(0xbd, 0xc3, 0xc7), // white
+            Color::rgb(0x7f, 0x8c, 0x8d), // bright black
+            Color::rgb(0xe7, 0x4c, 0x3c), // bright red
+            Color::rgb(0x2e, 0xcc, 0x71), // bright green
+            Color::rgb(0xf3, 0x9c, 0x12), // bright yellow
+            Color::rgb(0x34, 0x98, 0xdb), // bright blue
+            Color::rgb(0x9b, 0x59, 0xb6), // bright magenta
+            Color::rgb(0x1a, 0xbc, 0x9c), // bright cyan
+            Color::rgb(0xec, 0xf0, 0xf1), // bright white
+        ];
+        let mut palette = [Color::rgb(0, 0, 0); 256];
+        for (i, c) in ansi.iter().enumerate() { palette[i] = *c; }
+        for i in 16..256u16 { palette[i as usize] = Color::xterm_256(i as u8); }
+        Self {
+            name: "Skyterm Gray".into(),
+            fg: Color::rgb(0x2c, 0x2c, 0x2c),
+            bg: Color::rgb(0xee, 0xee, 0xee),
+            cursor: Color::rgb(0x55, 0x55, 0x55),
+            palette,
+        }
+    }
+
+    /// Built-in theme: warm sandy beige — earthy palette for low-glare daylight use.
+    pub fn skyterm_beige() -> Self {
+        let ansi: [Color; 16] = [
+            Color::rgb(0x2c, 0x1e, 0x0f), // black (dark brown)
+            Color::rgb(0xb0, 0x3a, 0x2e), // red (warm crimson)
+            Color::rgb(0x5d, 0x7a, 0x1f), // green (olive)
+            Color::rgb(0xb7, 0x86, 0x0b), // yellow (golden)
+            Color::rgb(0x2e, 0x6d, 0xa4), // blue (steel)
+            Color::rgb(0x8e, 0x44, 0x7a), // magenta (dusty rose)
+            Color::rgb(0x1a, 0x7d, 0x73), // cyan (teal)
+            Color::rgb(0xd4, 0xc9, 0xb0), // white (light tan)
+            Color::rgb(0x7a, 0x67, 0x52), // bright black (warm gray)
+            Color::rgb(0xe0, 0x4e, 0x3b), // bright red
+            Color::rgb(0x7d, 0xb5, 0x2f), // bright green
+            Color::rgb(0xe6, 0xa8, 0x17), // bright yellow
+            Color::rgb(0x4a, 0x90, 0xc4), // bright blue
+            Color::rgb(0xb0, 0x6e, 0xc0), // bright magenta
+            Color::rgb(0x2a, 0x9e, 0x93), // bright cyan
+            Color::rgb(0xf5, 0xf0, 0xe8), // bright white
+        ];
+        let mut palette = [Color::rgb(0, 0, 0); 256];
+        for (i, c) in ansi.iter().enumerate() { palette[i] = *c; }
+        for i in 16..256u16 { palette[i as usize] = Color::xterm_256(i as u8); }
+        Self {
+            name: "Skyterm Beige".into(),
+            fg: Color::rgb(0x3a, 0x2e, 0x20),
+            bg: Color::rgb(0xf2, 0xe8, 0xd5),
+            cursor: Color::rgb(0x8c, 0x6d, 0x3f),
+            palette,
+        }
+    }
+
+    /// Built-in theme: hunter green — deep forest aesthetic with naturalistic ANSI colors.
+    pub fn skyterm_hunter() -> Self {
+        let ansi: [Color; 16] = [
+            Color::rgb(0x0d, 0x1a, 0x10), // black (near-black forest)
+            Color::rgb(0xcc, 0x44, 0x44), // red (muted crimson)
+            Color::rgb(0x5a, 0xb4, 0x5a), // green (medium forest)
+            Color::rgb(0xc8, 0xa0, 0x30), // yellow (golden)
+            Color::rgb(0x44, 0x88, 0xbb), // blue (steel)
+            Color::rgb(0x99, 0x66, 0xaa), // magenta (muted purple)
+            Color::rgb(0x44, 0xaa, 0x88), // cyan (forest teal)
+            Color::rgb(0xa8, 0xc8, 0xa8), // white (sage)
+            Color::rgb(0x3a, 0x5a, 0x3a), // bright black (dark moss)
+            Color::rgb(0xe0, 0x55, 0x55), // bright red
+            Color::rgb(0x77, 0xcc, 0x77), // bright green
+            Color::rgb(0xdd, 0xb8, 0x40), // bright yellow
+            Color::rgb(0x66, 0xaa, 0xdd), // bright blue
+            Color::rgb(0xbb, 0x88, 0xcc), // bright magenta
+            Color::rgb(0x55, 0xcc, 0x99), // bright cyan
+            Color::rgb(0xd8, 0xea, 0xd8), // bright white (pale sage)
+        ];
+        let mut palette = [Color::rgb(0, 0, 0); 256];
+        for (i, c) in ansi.iter().enumerate() { palette[i] = *c; }
+        for i in 16..256u16 { palette[i as usize] = Color::xterm_256(i as u8); }
+        Self {
+            name: "Skyterm Hunter".into(),
+            fg: Color::rgb(0xb8, 0xd4, 0xb8),
+            bg: Color::rgb(0x1a, 0x2a, 0x1e),
+            cursor: Color::rgb(0x6d, 0xbf, 0x6d),
+            palette,
+        }
+    }
+
+    /// Built-in theme: Cobalt Neon — deep cobalt blue with electric neon accents.
+    pub fn cobalt_neon() -> Self {
+        let ansi: [Color; 16] = [
+            Color::rgb(0x0a, 0x0f, 0x1e), // black
+            Color::rgb(0xff, 0x2d, 0x5e), // red (neon hot pink)
+            Color::rgb(0x00, 0xff, 0x88), // green (neon mint)
+            Color::rgb(0xff, 0xe6, 0x00), // yellow (electric)
+            Color::rgb(0x3d, 0x9a, 0xff), // blue (electric cobalt)
+            Color::rgb(0xff, 0x00, 0xcc), // magenta (neon fuchsia)
+            Color::rgb(0x00, 0xe5, 0xff), // cyan (neon electric)
+            Color::rgb(0xc8, 0xd8, 0xf0), // white (light blue-white)
+            Color::rgb(0x2a, 0x3a, 0x5a), // bright black (dark cobalt)
+            Color::rgb(0xff, 0x50, 0x80), // bright red
+            Color::rgb(0x39, 0xff, 0x95), // bright green
+            Color::rgb(0xff, 0xee, 0x44), // bright yellow
+            Color::rgb(0x66, 0xb2, 0xff), // bright blue
+            Color::rgb(0xff, 0x44, 0xdd), // bright magenta
+            Color::rgb(0x44, 0xee, 0xff), // bright cyan
+            Color::rgb(0xff, 0xff, 0xff), // bright white
+        ];
+        let mut palette = [Color::rgb(0, 0, 0); 256];
+        for (i, c) in ansi.iter().enumerate() { palette[i] = *c; }
+        for i in 16..256u16 { palette[i as usize] = Color::xterm_256(i as u8); }
+        Self {
+            name: "Cobalt Neon".into(),
+            fg: Color::rgb(0xc8, 0xe0, 0xff),
+            bg: Color::rgb(0x0d, 0x1f, 0x3c),
+            cursor: Color::rgb(0x00, 0xe5, 0xff),
+            palette,
+        }
+    }
+
+    /// Built-in theme: GitHub Light — canonical GitHub UI palette.
+    pub fn github_light() -> Self {
+        let ansi: [Color; 16] = [
+            Color::rgb(0x24, 0x29, 0x2e), // black
+            Color::rgb(0xd7, 0x3a, 0x49), // red
+            Color::rgb(0x22, 0x86, 0x3a), // green
+            Color::rgb(0xb0, 0x88, 0x00), // yellow (amber)
+            Color::rgb(0x00, 0x5c, 0xc5), // blue
+            Color::rgb(0x6f, 0x42, 0xc1), // magenta (purple)
+            Color::rgb(0x1b, 0x7c, 0x83), // cyan
+            Color::rgb(0x6a, 0x73, 0x7d), // white (medium gray)
+            Color::rgb(0x58, 0x60, 0x69), // bright black
+            Color::rgb(0xcb, 0x24, 0x31), // bright red
+            Color::rgb(0x28, 0xa7, 0x45), // bright green
+            Color::rgb(0xdb, 0xab, 0x09), // bright yellow
+            Color::rgb(0x03, 0x66, 0xd6), // bright blue (GitHub blue)
+            Color::rgb(0x8a, 0x63, 0xd2), // bright magenta
+            Color::rgb(0x21, 0x88, 0xff), // bright cyan
+            Color::rgb(0xff, 0xff, 0xff), // bright white
+        ];
+        let mut palette = [Color::rgb(0, 0, 0); 256];
+        for (i, c) in ansi.iter().enumerate() { palette[i] = *c; }
+        for i in 16..256u16 { palette[i as usize] = Color::xterm_256(i as u8); }
+        Self {
+            name: "Github".into(),
+            fg: Color::rgb(0x24, 0x29, 0x2e),
+            bg: Color::rgb(0xf6, 0xf8, 0xfa),
+            cursor: Color::rgb(0x03, 0x66, 0xd6),
+            palette,
+        }
+    }
+
+    /// True when this theme's background is perceptually dark (luma < 128).
+    pub fn is_dark(&self) -> bool {
+        let b = &self.bg;
+        let luma = 299u32 * b.r as u32 + 587 * b.g as u32 + 114 * b.b as u32;
+        luma < 128_000
+    }
+
+    /// All built-in presets — dark themes first, then light.
     pub fn presets() -> Vec<Theme> {
         vec![
             Theme::skyterm_blue(),
+            Theme::cobalt_neon(),
             Theme::skyterm_dark(),
+            Theme::skyterm_dracula(),
+            Theme::skyterm_hunter(),
+            Theme::skyterm_purple(),
             Theme::solarized_dark(),
+            Theme::github_light(),
             Theme::solarized_light(),
             Theme::skyterm_light(),
+            Theme::skyterm_atom(),
+            Theme::skyterm_gray(),
+            Theme::skyterm_beige(),
         ]
     }
 }

@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use glow::HasContext;
 use skyterm_core::{
     theme::{Color, Theme},
-    Grid,
+    CursorShape, Grid,
 };
 
 use crate::font::Atlas;
@@ -76,24 +76,28 @@ void main() {
 const FG_VERT: &str = r#"#version 330 core
 layout(location = 0) in vec2 a_pos;
 layout(location = 1) in vec2 a_uv;
-layout(location = 2) in vec3 a_color;
+layout(location = 2) in vec3 a_fg;
+layout(location = 3) in vec3 a_bg;
 out vec2 v_uv;
-out vec3 v_color;
+out vec3 v_fg;
+out vec3 v_bg;
 void main() {
     gl_Position = vec4(a_pos, 0.0, 1.0);
     v_uv = a_uv;
-    v_color = a_color;
+    v_fg = a_fg;
+    v_bg = a_bg;
 }
 "#;
 
 const FG_FRAG: &str = r#"#version 330 core
 in vec2 v_uv;
-in vec3 v_color;
+in vec3 v_fg;
+in vec3 v_bg;
 out vec4 frag;
 uniform sampler2D u_atlas;
 void main() {
-    float a = texture(u_atlas, v_uv).r;
-    frag = vec4(v_color, a);
+    vec3 lcd = texture(u_atlas, v_uv).rgb;
+    frag = vec4(v_fg * lcd + v_bg * (1.0 - lcd), 1.0);
 }
 "#;
 
@@ -137,11 +141,11 @@ impl Renderer {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                glow::R8 as i32,
+                glow::RGB8 as i32,
                 atlas.width as i32,
                 atlas.height as i32,
                 0,
-                glow::RED,
+                glow::RGB,
                 glow::UNSIGNED_BYTE,
                 Some(&atlas.pixels),
             );
@@ -211,11 +215,11 @@ impl Renderer {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                glow::R8 as i32,
+                glow::RGB8 as i32,
                 atlas.width as i32,
                 atlas.height as i32,
                 0,
-                glow::RED,
+                glow::RGB,
                 glow::UNSIGNED_BYTE,
                 Some(&atlas.pixels),
             );
@@ -229,7 +233,7 @@ impl Renderer {
         self.fallback_slot = atlas.fallback_slot;
     }
 
-    pub fn render(&mut self, grid: &Grid, selection: Option<Selection>, theme: &Theme) {
+    pub fn render(&mut self, grid: &Grid, selection: Option<Selection>, theme: &Theme, cursor_on: bool) {
         if self.viewport_w <= 0 || self.viewport_h <= 0 {
             return;
         }
@@ -277,35 +281,70 @@ impl Renderer {
             }
         }
 
-        // Underline cursor (drawn in the bg pass so it sits under the glyph).
-        // Hidden when scrolled up past the live screen, or when the app has
-        // hidden the cursor (DEC ?25l) — full-screen TUIs use that.
-        if grid.cursor_visible() {
-            if let Some((cur_row, cur_col)) = grid.visible_cursor() {
-                if cur_row < grid.rows() && cur_col < grid.cols() {
-                    let underline_h = (ch * 0.12).max(2.0);
-                    let px0 = cur_col as f32 * cw;
-                    let py1 = (cur_row + 1) as f32 * ch;
-                    let py0 = py1 - underline_h;
+        // Cursor background quad. Shape is set by DECSCUSR from the app;
+        // defaults to Block. Hidden during off-blink phase, scrollback, or ?25l.
+        let cursor_cell = if cursor_on && grid.cursor_visible() {
+            grid.visible_cursor().filter(|&(r, c)| r < grid.rows() && c < grid.cols())
+        } else {
+            None
+        };
+        let cursor_shape = grid.cursor_shape();
+
+        if let Some((cur_row, cur_col)) = cursor_cell {
+            let px0 = cur_col as f32 * cw;
+            let py0 = cur_row as f32 * ch;
+            match cursor_shape {
+                CursorShape::Block => {
+                    // Full cell — glyph pass will invert the character on top.
                     push_solid_quad(
                         &mut self.bg_scratch,
-                        to_ndc_x(px0),
-                        to_ndc_y(py0),
-                        to_ndc_x(px0 + cw),
-                        to_ndc_y(py1),
+                        to_ndc_x(px0), to_ndc_y(py0),
+                        to_ndc_x(px0 + cw), to_ndc_y(py0 + ch),
+                        theme.cursor,
+                    );
+                }
+                CursorShape::Underline => {
+                    let h = (ch * 0.12).max(2.0);
+                    push_solid_quad(
+                        &mut self.bg_scratch,
+                        to_ndc_x(px0), to_ndc_y(py0 + ch - h),
+                        to_ndc_x(px0 + cw), to_ndc_y(py0 + ch),
+                        theme.cursor,
+                    );
+                }
+                CursorShape::Bar => {
+                    let w = (cw * 0.12).max(2.0);
+                    push_solid_quad(
+                        &mut self.bg_scratch,
+                        to_ndc_x(px0), to_ndc_y(py0),
+                        to_ndc_x(px0 + w), to_ndc_y(py0 + ch),
                         theme.cursor,
                     );
                 }
             }
         }
 
-        // Pass 2: glyph quads.
+        // Pass 2: glyph quads. LCD sub-pixel blending needs the bg color per
+        // cell so the shader can mix fg and bg per R/G/B channel.
+        // At the block-cursor cell we invert fg/bg so the character reads
+        // against the cursor background color.
         for row in 0..grid.rows() {
             for col in 0..grid.cols() {
                 let cell = grid.visible_cell(row, col);
                 if cell.ch == ' ' {
                     continue;
                 }
+                let selected = selection.map(|s| s.contains(row, col)).unwrap_or(false);
+                let at_block_cursor = matches!(cursor_shape, CursorShape::Block)
+                    && cursor_cell == Some((row, col));
+                let (fg_color, bg_color) = if at_block_cursor {
+                    // Character rendered in terminal-bg over cursor-color block.
+                    (theme.bg, theme.cursor)
+                } else if selected {
+                    (theme.resolve_fg(cell.fg), SELECTION_BG)
+                } else {
+                    (theme.resolve_fg(cell.fg), theme.resolve_bg(cell.bg))
+                };
                 let cp = cell.ch as u32;
                 let slot = *self.glyph_locations.get(&cp).unwrap_or(&self.fallback_slot);
                 let slot_x = slot % glyphs_per_row;
@@ -325,7 +364,8 @@ impl Renderer {
                     v0,
                     u1,
                     v1,
-                    theme.resolve_fg(cell.fg),
+                    fg_color,
+                    bg_color,
                 );
             }
         }
@@ -355,9 +395,9 @@ impl Renderer {
                 gl.draw_arrays(glow::TRIANGLES, 0, n);
             }
 
-            // Fg pass — alpha blended glyphs.
-            gl.enable(glow::BLEND);
-            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            // Fg pass — LCD sub-pixel blending done in the shader; output is
+            // fully opaque so no GPU blending needed.
+            gl.disable(glow::BLEND);
             if !self.fg_scratch.is_empty() {
                 gl.use_program(Some(self.fg_program));
                 gl.bind_vertex_array(Some(self.fg_vao));
@@ -366,8 +406,8 @@ impl Renderer {
                 gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STREAM_DRAW);
                 gl.active_texture(glow::TEXTURE0);
                 gl.bind_texture(glow::TEXTURE_2D, Some(self.atlas_tex));
-                // 7 floats per vertex (x, y, u, v, r, g, b).
-                let n = (self.fg_scratch.len() / 7) as i32;
+                // 10 floats per vertex (x, y, u, v, fg.r, fg.g, fg.b, bg.r, bg.g, bg.b).
+                let n = (self.fg_scratch.len() / 10) as i32;
                 gl.draw_arrays(glow::TRIANGLES, 0, n);
             }
         }
@@ -410,13 +450,16 @@ unsafe fn create_fg_vao(gl: &glow::Context) -> Result<(glow::VertexArray, glow::
     gl.bind_vertex_array(Some(vao));
     let vbo = gl.create_buffer().map_err(|e| anyhow!("create_buffer: {e}"))?;
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-    let stride = (7 * std::mem::size_of::<f32>()) as i32;
+    // 10 floats per vertex: pos(2) + uv(2) + fg(3) + bg(3)
+    let stride = (10 * std::mem::size_of::<f32>()) as i32;
     gl.enable_vertex_attrib_array(0);
     gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
     gl.enable_vertex_attrib_array(1);
     gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, (2 * 4) as i32);
     gl.enable_vertex_attrib_array(2);
     gl.vertex_attrib_pointer_f32(2, 3, glow::FLOAT, false, stride, (4 * 4) as i32);
+    gl.enable_vertex_attrib_array(3);
+    gl.vertex_attrib_pointer_f32(3, 3, glow::FLOAT, false, stride, (7 * 4) as i32);
     Ok((vao, vbo))
 }
 
@@ -446,18 +489,22 @@ fn push_glyph_quad(
     v0: f32,
     u1: f32,
     v1: f32,
-    c: Color,
+    fg: Color,
+    bg: Color,
 ) {
-    let r = c.r as f32 / 255.0;
-    let g = c.g as f32 / 255.0;
-    let b = c.b as f32 / 255.0;
+    let fr = fg.r as f32 / 255.0;
+    let fg_g = fg.g as f32 / 255.0;
+    let fb = fg.b as f32 / 255.0;
+    let br = bg.r as f32 / 255.0;
+    let bg_g = bg.g as f32 / 255.0;
+    let bb = bg.b as f32 / 255.0;
     let v = [
-        x0, y0, u0, v0, r, g, b,
-        x1, y0, u1, v0, r, g, b,
-        x1, y1, u1, v1, r, g, b,
-        x0, y0, u0, v0, r, g, b,
-        x1, y1, u1, v1, r, g, b,
-        x0, y1, u0, v1, r, g, b,
+        x0, y0, u0, v0, fr, fg_g, fb, br, bg_g, bb,
+        x1, y0, u1, v0, fr, fg_g, fb, br, bg_g, bb,
+        x1, y1, u1, v1, fr, fg_g, fb, br, bg_g, bb,
+        x0, y0, u0, v0, fr, fg_g, fb, br, bg_g, bb,
+        x1, y1, u1, v1, fr, fg_g, fb, br, bg_g, bb,
+        x0, y1, u0, v1, fr, fg_g, fb, br, bg_g, bb,
     ];
     buf.extend_from_slice(&v);
 }
