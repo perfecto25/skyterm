@@ -927,7 +927,14 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
             let Some(p) = pane_w.upgrade() else { return };
             let path = p.font_path.borrow().clone();
             let size = p.font_size.get();
-            let atlas = match font::build_atlas(&path, size) {
+            // On HiDPI (macOS Retina, scale_factor=2) the GL framebuffer is
+            // device-pixel-sized while area.width()/height() report logical
+            // pixels. The atlas must be rasterized at device resolution so the
+            // glyphs look right, and the renderer's viewport+grid math must use
+            // device pixels too — otherwise GL only draws into the bottom-left
+            // quadrant of the framebuffer and the prompt floats mid-screen.
+            let scale = area.scale_factor().max(1) as u32;
+            let atlas = match font::build_atlas(&path, size * scale) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("skyterm: atlas build on realize: {e}");
@@ -942,8 +949,8 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
                     return;
                 }
             };
-            let w = area.width();
-            let h = area.height();
+            let w = area.width() * scale as i32;
+            let h = area.height() * scale as i32;
             if w > 0 && h > 0 {
                 renderer.resize(w, h);
             }
@@ -962,8 +969,10 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
         let blink_phase = state.blink_phase.clone();
         pane.gl_area.connect_render(move |area, _ctx| {
             if let Some(p) = pane_w.upgrade() {
-                let w = area.width();
-                let h = area.height();
+                // Device pixels — see the matching comment in connect_realize.
+                let scale = area.scale_factor().max(1);
+                let w = area.width() * scale;
+                let h = area.height() * scale;
                 // NOTE: do NOT reflow the grid here. Reflow moves the cursor,
                 // and doing it per-frame during a drag interleaves with the
                 // shell's SIGWINCH prompt redraw, corrupting the screen. Reflow
@@ -1042,8 +1051,12 @@ fn schedule_reflow(p: &Rc<Pane>) {
         // Clear the stored handle first: this source is one-shot and about to
         // finish, so a later resize must not try to .remove() a dead id.
         p.resize_source.replace(None);
-        let (lw, lh) = (p.gl_area.width(), p.gl_area.height());
-        if reflow_to_pixels(&p, lw, lh) {
+        // cell_dims is in device pixels (atlas rasterized at font_size * scale),
+        // so the widget dimensions must be in device pixels too for the row/col
+        // arithmetic to match what the renderer draws.
+        let scale = p.gl_area.scale_factor().max(1);
+        let (dw, dh) = (p.gl_area.width() * scale, p.gl_area.height() * scale);
+        if reflow_to_pixels(&p, dw, dh) {
             sync_scrollbar(&p);
             p.gl_area.queue_render();
         }
@@ -1101,16 +1114,20 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
             let Some(p) = pane_w.upgrade() else {
                 return;
             };
-            // The signal's (w, h) are device pixels (framebuffer size) — used
-            // for the GL viewport, which we update immediately so the window
-            // keeps painting during a drag. The grid+PTY reflow is *debounced*:
-            // reflow moves the cursor and triggers a SIGWINCH prompt redraw, so
-            // doing it on every intermediate drag size makes the shell's
-            // redraws interleave and corrupt the screen. We act once the size
-            // settles instead.
-            log::debug!("connect_resize: device {w}x{h}, logical {}x{}", area.width(), area.height());
+            // The signal's (w, h) are unreliable across backends: on macOS GTK4
+            // delivers logical pixels here while the actual GL framebuffer is
+            // device-sized, which causes GL to draw into only one quadrant.
+            // Compute device pixels explicitly from area.width() * scale_factor
+            // so the viewport matches the framebuffer on every backend.
+            let scale = area.scale_factor().max(1);
+            let dw = area.width() * scale;
+            let dh = area.height() * scale;
+            log::debug!(
+                "connect_resize: signal {w}x{h}, logical {}x{}, scale {scale}, device {dw}x{dh}",
+                area.width(), area.height()
+            );
             if let Some(r) = p.renderer.borrow_mut().as_mut() {
-                r.resize(w, h);
+                r.resize(dw, dh);
             }
             p.gl_area.queue_render();
             schedule_reflow(&p);
@@ -1135,16 +1152,24 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
         });
     }
 
-    // Mouse wheel — Ctrl+wheel zooms the *focused* pane; plain wheel either
-    // forwards scroll events to the PTY (when the app has enabled mouse
-    // reporting) or drives the scrollback view.
+    // Mouse wheel — modifier+wheel zooms the *focused* pane; plain wheel
+    // either forwards scroll events to the PTY (when the app has enabled mouse
+    // reporting) or drives the scrollback view. On macOS the zoom modifier is
+    // ⌘ (META) so it matches the rest of the app shortcuts and stays out of
+    // the shell's way (Ctrl is the shell's modifier on Mac). On Linux/Windows
+    // it's Ctrl, matching gnome-terminal / iTerm-on-Linux conventions.
     {
         let state = state.clone();
         let pane_w = Rc::downgrade(pane);
         let scroll_ctrl = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
         scroll_ctrl.connect_scroll(move |ctrl, _dx, dy| {
             let mods = ctrl.current_event_state();
-            if mods.contains(gdk::ModifierType::CONTROL_MASK) {
+            let zoom_mod = if cfg!(target_os = "macos") {
+                gdk::ModifierType::META_MASK
+            } else {
+                gdk::ModifierType::CONTROL_MASK
+            };
+            if mods.contains(zoom_mod) {
                 if let Some(focused) = focused_pane(&state) {
                     if dy < 0.0 {
                         change_font_size(&focused, 1);
@@ -1443,6 +1468,76 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
                 return glib::Propagation::Stop;
             };
 
+            // macOS: ⌘-direct shortcuts (iTerm2-style). Ctrl is reserved for the
+            // shell on Mac — Ctrl+A is readline's beginning-of-line, Ctrl+C is
+            // SIGINT, Ctrl+V is literal-quote — so we put app actions on ⌘
+            // (META_MASK) instead. The Ctrl+A chord prefix is suppressed below
+            // on macOS for the same reason.
+            if cfg!(target_os = "macos")
+                && modifiers.contains(gdk::ModifierType::META_MASK)
+            {
+                let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+                let alt = modifiers.contains(gdk::ModifierType::ALT_MASK);
+                let target = focused_pane(&state).unwrap_or_else(|| p.clone());
+
+                // ⌘D  vertical split (new pane to the right)
+                // ⌘⇧D horizontal split (new pane below)
+                if matches!(keyval, gdk::Key::d | gdk::Key::D) {
+                    let dir = if shift { SplitDir::Down } else { SplitDir::Right };
+                    split(&state, &target, dir);
+                    return glib::Propagation::Stop;
+                }
+                // ⌘T new tab
+                if matches!(keyval, gdk::Key::t | gdk::Key::T) {
+                    new_tab(&state);
+                    return glib::Propagation::Stop;
+                }
+                // ⌘O cycle focus to the next pane in this tab
+                if matches!(keyval, gdk::Key::o | gdk::Key::O) {
+                    focus_next_pane(&state);
+                    return glib::Propagation::Stop;
+                }
+                // ⌘⌥arrows: focus the pane in that direction
+                if alt {
+                    let focus_dir = match keyval {
+                        gdk::Key::Up => Some(SplitDir::Up),
+                        gdk::Key::Down => Some(SplitDir::Down),
+                        gdk::Key::Left => Some(SplitDir::Left),
+                        gdk::Key::Right => Some(SplitDir::Right),
+                        _ => None,
+                    };
+                    if let Some(dir) = focus_dir {
+                        focus_direction(&state, dir);
+                        return glib::Propagation::Stop;
+                    }
+                }
+                // ⌘C copy / ⌘V paste
+                if matches!(keyval, gdk::Key::c | gdk::Key::C) {
+                    copy_selection(&p);
+                    return glib::Propagation::Stop;
+                }
+                if matches!(keyval, gdk::Key::v | gdk::Key::V) {
+                    paste(&p, false);
+                    return glib::Propagation::Stop;
+                }
+                // ⌘+ / ⌘= / ⌘- / ⌘0 font zoom
+                match keyval {
+                    gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => {
+                        change_font_size(&target, 1);
+                        return glib::Propagation::Stop;
+                    }
+                    gdk::Key::minus | gdk::Key::KP_Subtract => {
+                        change_font_size(&target, -1);
+                        return glib::Propagation::Stop;
+                    }
+                    gdk::Key::_0 | gdk::Key::KP_0 => {
+                        change_font_size(&target, 0);
+                        return glib::Propagation::Stop;
+                    }
+                    _ => {}
+                }
+            }
+
             // 1) Chord armed? Interpret the second key.
             let armed = state
                 .chord_at
@@ -1490,6 +1585,23 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
                     focus_direction(&state, dir);
                     return glib::Propagation::Stop;
                 }
+                // ' (apostrophe) — previous theme; / (slash) — next theme.
+                // Wraps around the combined built-in + user theme list and
+                // persists the new selection to config. The chord is *re-armed*
+                // after firing so the user can rapid-scroll by holding Ctrl+A
+                // and tapping ' / / repeatedly without having to hit the full
+                // 3-key combo every time. Any non-cycle key (or the 2s timeout
+                // expiring) disarms the chord normally.
+                let delta = match keyval {
+                    gdk::Key::apostrophe => Some(-1),
+                    gdk::Key::slash => Some(1),
+                    _ => None,
+                };
+                if let Some(d) = delta {
+                    cycle_theme(&state, &p, d);
+                    state.chord_at.set(Some(Instant::now()));
+                    return glib::Propagation::Stop;
+                }
                 let dir = match keyval {
                     gdk::Key::Up => Some(SplitDir::Up),
                     gdk::Key::Down => Some(SplitDir::Down),
@@ -1504,8 +1616,17 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
                 return glib::Propagation::Stop;
             }
 
-            // 2) Prefix: Ctrl+A — arm chord, swallow.
-            if modifiers.contains(gdk::ModifierType::CONTROL_MASK)
+            // 2) Prefix: Ctrl+A (Linux/Windows) or ⌘A (macOS) — arm chord,
+            // swallow. We use ⌘ on Mac instead of Ctrl so the shell's readline
+            // beginning-of-line on Ctrl+A keeps working. ⌘A's usual Mac
+            // meaning (Select All) is unused inside a terminal grid, so we
+            // appropriate it as the chord prefix to mirror Linux's UX.
+            let chord_mod = if cfg!(target_os = "macos") {
+                gdk::ModifierType::META_MASK
+            } else {
+                gdk::ModifierType::CONTROL_MASK
+            };
+            if modifiers.contains(chord_mod)
                 && matches!(keyval, gdk::Key::a | gdk::Key::A)
             {
                 state.chord_at.set(Some(Instant::now()));
@@ -2056,8 +2177,11 @@ fn pixel_to_cell(pane: &Pane, x: f64, y: f64) -> Option<(usize, usize)> {
     if cw == 0 || ch == 0 {
         return None;
     }
-    let col = (x.max(0.0) as u32 / cw) as usize;
-    let row = (y.max(0.0) as u32 / ch) as usize;
+    // GTK gesture coordinates are logical pixels but cell_dims is in device
+    // pixels (atlas rasterized at font_size * scale_factor). Convert.
+    let scale = pane.gl_area.scale_factor().max(1) as f64;
+    let col = ((x.max(0.0) * scale) as u32 / cw) as usize;
+    let row = ((y.max(0.0) * scale) as u32 / ch) as usize;
     let g = pane.grid.borrow();
     if g.cols() == 0 || g.rows() == 0 {
         return None;
@@ -2105,7 +2229,9 @@ fn set_font_size(pane: &Pane, target: u32) {
         return;
     }
     let path = pane.font_path.borrow().clone();
-    let new_atlas = match font::build_atlas(&path, target) {
+    // Rasterize at device resolution — see the comment in connect_realize.
+    let scale = pane.gl_area.scale_factor().max(1) as u32;
+    let new_atlas = match font::build_atlas(&path, target * scale) {
         Ok(a) => a,
         Err(e) => {
             log::warn!("font resize to {target}px failed: {e}");
@@ -2235,7 +2361,8 @@ fn apply_font_family_all(state: &Rc<WindowState>, new_path: PathBuf) {
     for tab in state.tabs.borrow().iter() {
         for pane in tab.panes.borrow().iter() {
             let size = pane.font_size.get();
-            let Ok(atlas) = font::build_atlas(&new_path, size) else {
+            let scale = pane.gl_area.scale_factor().max(1) as u32;
+            let Ok(atlas) = font::build_atlas(&new_path, size * scale) else {
                 continue;
             };
             pane.cell_dims.set((atlas.cell_w, atlas.cell_h));
@@ -2258,6 +2385,28 @@ fn apply_theme(state: &Rc<WindowState>, theme: Theme) {
             pane.gl_area.queue_render();
         }
     }
+}
+
+/// Step through `available_themes` by `delta` (+1 next, -1 previous), wrapping
+/// at the ends. Only the given pane is updated — the chord is per-pane so the
+/// user can theme individual panes differently. Not persisted to config (config
+/// holds the global default theme set from Settings).
+fn cycle_theme(state: &Rc<WindowState>, pane: &Rc<Pane>, delta: isize) {
+    let themes = &state.available_themes;
+    if themes.is_empty() {
+        return;
+    }
+    let current = pane.theme.borrow().name.clone();
+    let idx = themes
+        .iter()
+        .position(|t| t.name == current)
+        .unwrap_or(0) as isize;
+    let len = themes.len() as isize;
+    let next = ((idx + delta) % len + len) % len;
+    let theme = themes[next as usize].clone();
+    log::info!("cycle theme -> {} (pane)", theme.name);
+    *pane.theme.borrow_mut() = theme;
+    pane.gl_area.queue_render();
 }
 
 /// Set the maximum scrollback lines per pane.
