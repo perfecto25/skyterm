@@ -238,3 +238,4 @@ for MacOS builds
 - change split menu option to single row with 4 sub buttons Up, Down, Left, Right
 - add keyboard shortcut helpers to all menu commands (gray shortcut helper text)
 - add button few pixels to right of rightmost tab "new tab", should be able to create new tab via button (along w menu and KB shortcut)
+- add ability to drag and drop panes in different locations, ie terminator behavior, move panes left, right etc
