@@ -45,6 +45,7 @@ name = "skyterm"
 maintainer = "skyterm contributors"
 copyright = "2024, skyterm contributors"
 license-file = ["../LICENSE-MIT", "4"]
+maintainer-scripts = "debian/"
 depends = "libgtk-4-1 (>= 4.12), libfreetype6, libgl1"
 section = "x11"
 priority = "optional"

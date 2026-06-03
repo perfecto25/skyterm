@@ -26,6 +26,15 @@ check_deps() {
         cargo install cargo-deb
     fi
 
+    # sudo apt update && sudo apt install -y \
+    # build-essential \
+    # pkg-config \
+    # libgtk-4-dev \
+    # libepoxy-dev \
+    # libfreetype-dev \
+    # libfontconfig1-dev \
+    # libglib2.0-dev
+
     info "Prerequisites OK"
 }
 
@@ -34,10 +43,16 @@ check_deps() {
 build_release() {
     info "Building release binary..."
 
-    cargo build \
-        --release \
-        --package skyterm-gui \
-        --locked
+    # rustc >= 1.90 defaults to the bundled rust-lld linker, which does NOT
+    # search the system/multiarch lib dirs (e.g. /usr/lib/x86_64-linux-gnu on
+    # Debian/Ubuntu) the way GNU ld does. That makes -lgtk-4/-lepoxy/etc.
+    # "unable to find library" on Debian-family build hosts. Force the system
+    # GNU linker (ld.bfd) for the deb build so the GTK4 libs resolve.
+    RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-fuse-ld=bfd" \
+        cargo build \
+            --release \
+            --package skyterm-gui \
+            --locked
 
     local bin="target/release/skyterm"
     [[ -f "$bin" ]] || die "Binary not found at $bin after build"

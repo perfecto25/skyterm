@@ -234,3 +234,7 @@ for MacOS builds
 - add ability to view images in terminal
 - add syntax highlighter for bash, python, json, yaml via cat
 - add ability to modify keyboard shortcuts via config file
+- add New Window command
+- change split menu option to single row with 4 sub buttons Up, Down, Left, Right
+- add keyboard shortcut helpers to all menu commands (gray shortcut helper text)
+- add button few pixels to right of rightmost tab "new tab", should be able to create new tab via button (along w menu and KB shortcut)

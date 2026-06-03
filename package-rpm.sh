@@ -43,7 +43,7 @@ build_release() {
     #         --package skyterm-gui \
     #         --locked
 
-    #RUSTFLAGS="-C target-cpu=native" \
+    RUSTFLAGS="-C target-cpu=native" \
         cargo build \
             --release \
             --package skyterm-gui \

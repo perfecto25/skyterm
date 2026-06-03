@@ -24,3 +24,18 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 
+
+# cargo-deb path bases (verified with cargo-deb 3.7): `license-file` and the
+# resource assets are resolved relative to THIS crate's dir (skyterm-gui/), so
+# `../LICENSE-MIT` reaches the workspace root and `resources/...` is local. The
+# binary uses cargo-deb's special `target/release/` token, which maps to the
+# shared workspace build output regardless of where you invoke cargo-deb.
+license-file = ["../LICENSE-MIT", "0"]
+depends = "libgtk-4-1 (>= 4.12), libfreetype6, libgl1"
+section = "x11"
+priority = "optional"
+assets = [
+    ["target/release/skyterm", "usr/bin/skyterm", "755"],
+    ["resources/skyterm.svg", "usr/share/icons/hicolor/scalable/apps/skyterm.svg", "644"],
+    ["resources/skyterm.desktop", "usr/share/applications/skyterm.desktop", "644"],
+]
