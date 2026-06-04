@@ -86,6 +86,22 @@ pub fn locate_monospace_font() -> Result<PathBuf> {
     Ok(PathBuf::from(EMBEDDED_FONT_PATH))
 }
 
+/// Return the font's family name as reported by FreeType, used to make the
+/// GTK chrome (right-click menu, banners) render in the same family as the
+/// terminal grid.
+pub fn family_name(font_path: &Path) -> Result<String> {
+    let lib = freetype::Library::init().context("freetype init")?;
+    let face = if font_path.to_str() == Some(EMBEDDED_FONT_PATH) {
+        lib.new_memory_face(EMBEDDED_FONT_BYTES.to_vec(), 0)
+            .context("loading embedded JetBrains Mono")?
+    } else {
+        lib.new_face(font_path, 0)
+            .with_context(|| format!("opening font {}", font_path.display()))?
+    };
+    face.family_name()
+        .ok_or_else(|| anyhow!("font reports no family name"))
+}
+
 pub fn build_atlas(font_path: &Path, size_px: u32) -> Result<Atlas> {
     build_atlas_with_ranges(font_path, size_px, &default_ranges())
 }

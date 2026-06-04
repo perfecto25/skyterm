@@ -158,9 +158,13 @@ Paste
     Shift + Ctrl + v
 
 
-#### Theme scrolling
+#### Color Themes
 
-You can scroll through available themes and see how they look
+Themes can be applied globally to all tabs and panes by going to Menu > Settings > Theme and choosing a color theme
+
+To apply to specific pane, right click on the pane, Menu > Themes > choose a theme - this will be applied locally to the pane
+
+You can also scroll through available themes and see how they look on the pane:
 
 ```
 Linux
@@ -173,6 +177,34 @@ MacOS
 
     hold down Command + A and hit ' or / to cycle up or down a theme
 ```
+
+**Custom Themes**
+
+to add your own custom theme, place a theme-name.toml file into 
+
+    ~/.config/skyterm/themes 
+    
+directory
+
+
+custom themes are declared in a TOML format
+
+    [themes]
+    [themes.MyTheme1]
+    palette = "#353535:#d25252:#a5c261:#ffc66d:#6c99bb:#d197d9:#bed6ff:#eeeeec:#535353:#f00c0c:#c2e075:#e1e48b:#8ab7d9:#efb5f7:#dcf4ff:#ffffff"
+    background_color = "#323232"
+    cursor_color = "#d6d6d6"
+    foreground_color = "#ffffff"
+    font_size = 12
+    font_path = "/usr/share/fonts/myfont/myfont.ttf"
+
+    [themes.SomeOtherTheme]
+    cursor_color = "#BAFFAA"
+    foreground_color = "#FFFFFF"
+    palette = "#444444:#FF0054:#B1D630:#9D895E:#67BEE3:#B576BC:#569A9F:#EDEDED:#777777:#D65E75:#BAFFAA:#ECE1C8:#9FD3E5:#DEB3DF:#B6E0E5:#FFFFFF"
+
+Custom themes will show up in Menu > Themes > Custom
+
 
 ### Custom configuration
 
@@ -228,14 +260,34 @@ for MacOS builds
 
     ./package-macos.sh
 
+
+### Changelog
+
+#### 0.1.5
+
+- tabs are wider in size and can be dragged left or right
+- maximum number of tabs by default is set to 20 for performance reasons. To change this number, update tab_max_number variable in config.toml
+- when trying to create new tab after max # of tab limit reached, a warning banner appears and explains why new tab isnt being opened
+- closing pane, tab or window now throws a confirmation prompt, can be disabled via confirm_ variables in config file
+
+    confirm_tab_close = true
+    confirm_pane_close = true
+    confirm_window_close = true
+
+- panes are now draggable, each pane has a small tooltip on top right, with Drag and Close buttons. Panes can be dragged into new horizontal or vertical position, when you hover over a new position, the position is highlighted with green color
+- added "new window" command to spawn off a new terminal window
+- can drag a pane into a different tab
+- custom themes can now be added via toml theme files
+
 ### Roadmap
 
-- add documentation on themes, add ability to integrate custom themes via terminator-style config files
+~~- add documentation on themes, add ability to integrate custom themes via terminator-style config files~~
 - add ability to view images in terminal
 - add syntax highlighter for bash, python, json, yaml via cat
 - add ability to modify keyboard shortcuts via config file
-- add New Window command
-- change split menu option to single row with 4 sub buttons Up, Down, Left, Right
-- add keyboard shortcut helpers to all menu commands (gray shortcut helper text)
+~~- add New Window command~~
+~~- change split menu option to single row with 4 sub buttons Up, Down, Left, Right~~
+~~- add keyboard shortcut helpers to all menu commands (gray shortcut helper text)~~
 - add button few pixels to right of rightmost tab "new tab", should be able to create new tab via button (along w menu and KB shortcut)
-- add ability to drag and drop panes in different locations, ie terminator behavior, move panes left, right etc
+~~- add ability to drag and drop panes in different locations, ie terminator behavior, move panes left, right etc~~
+~~- add ability to drag a pane into a different tab, highlight the drop placement area on the new tab~~
