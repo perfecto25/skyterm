@@ -1053,7 +1053,6 @@ fn make_tab(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Tab>> {
                     &state.window.clone(),
                     "Are you sure you want to close this tab?",
                     move || {
-                        state.force_close.set(true);
                         close_tab(&state, &t);
                     },
                 );
@@ -1152,6 +1151,7 @@ fn close_tab(state: &Rc<WindowState>, tab: &Rc<Tab>) {
 
     let remaining = state.tabs.borrow().len();
     if remaining == 0 {
+        state.force_close.set(true);
         state.window.close();
         return;
     }
@@ -2459,7 +2459,6 @@ fn request_close_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
             &state.window.clone(),
             "Are you sure you want to close this pane?",
             move || {
-                state.force_close.set(true);
                 close_pane(&state, &pane);
             },
         );
@@ -3907,6 +3906,7 @@ fn paste(pane: &Rc<Pane>, primary: bool) {
             let _ = w.write_all(b"\x1b[201~");
         }
         let _ = w.flush();
+        p.gl_area.grab_focus();
     });
 }
 
