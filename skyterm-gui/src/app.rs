@@ -105,6 +105,19 @@ button.pane-close-btn:hover {
     background: rgba(192, 57, 43, 0.55);
     color: #ffffff;
 }
+.pane-toolbar.on-dark {
+    background: rgba(230, 230, 230, 0.92);
+}
+.pane-toolbar.on-dark button {
+    color: #222222;
+}
+.pane-toolbar.on-dark button:hover {
+    background: rgba(0, 0, 0, 0.12);
+}
+.pane-toolbar.on-dark button.pane-toolbar-close:hover {
+    background: rgba(192, 57, 43, 0.55);
+    color: #ffffff;
+}
 .pane-drop-highlight {
     background: rgba(46, 204, 113, 0.30);
     border: 2px solid rgba(46, 204, 113, 0.95);
@@ -199,6 +212,8 @@ struct WindowState {
     confirm_pane_close: Cell<bool>,
     /// Show a confirmation dialog before closing the window via the OS button.
     confirm_window_close: Cell<bool>,
+    /// Whether to show the floating drag/close toolbar on split panes.
+    show_pane_toolbar: Cell<bool>,
     /// Set to `true` just before programmatically closing the window so the
     /// `close-request` handler lets it through without showing a second dialog.
     force_close: Cell<bool>,
@@ -444,6 +459,7 @@ pub fn on_activate(app: &Application) {
     let confirm_tab_close = cfg.confirm_tab_close.unwrap_or(true);
     let confirm_pane_close = cfg.confirm_pane_close.unwrap_or(true);
     let confirm_window_close = cfg.confirm_window_close.unwrap_or(true);
+    let show_pane_toolbar = cfg.show_pane_toolbar.unwrap_or(true);
 
     let state = Rc::new(WindowState {
         tabs: RefCell::new(Vec::new()),
@@ -468,6 +484,7 @@ pub fn on_activate(app: &Application) {
         confirm_tab_close: Cell::new(confirm_tab_close),
         confirm_pane_close: Cell::new(confirm_pane_close),
         confirm_window_close: Cell::new(confirm_window_close),
+        show_pane_toolbar: Cell::new(show_pane_toolbar),
         force_close: Cell::new(false),
         dragging: RefCell::new(None),
         css_provider,
@@ -730,6 +747,7 @@ fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
                 // — if the theme bundles them, apply globally so the user
                 // actually sees the font swap they asked for.
                 *pane.theme.borrow_mut() = theme.clone();
+                set_toolbar_contrast(&pane.toolbar, theme.bg);
                 pane.gl_area.queue_render();
                 apply_theme_font(&state, &theme);
             }
@@ -1375,6 +1393,8 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
         click_state: Cell::new((0, 0, 0, 0)),
         _child: RefCell::new(pty_handle.child),
     });
+
+    set_toolbar_contrast(&pane.toolbar, pane.theme.borrow().bg);
 
     {
         let state = state.clone();
@@ -2711,7 +2731,8 @@ fn rearrange_pane(state: &Rc<WindowState>, src: &Rc<Pane>, dst: &Rc<Pane>, dir: 
 fn update_pane_toolbars(state: &Rc<WindowState>, tab: &Rc<Tab>) {
     let tabs_count = state.tabs.borrow().len();
     let panes = tab.panes.borrow();
-    let show = panes.len() > 1 || tabs_count > 1;
+    let enabled = state.show_pane_toolbar.get();
+    let show = enabled && (panes.len() > 1 || tabs_count > 1);
     for p in panes.iter() {
         p.toolbar.set_visible(show);
     }
@@ -3301,6 +3322,18 @@ fn apply_theme_font(state: &Rc<WindowState>, theme: &Theme) {
     }
 }
 
+/// Toggle the `.on-dark` CSS class on `toolbar` based on the perceived
+/// luminance of `bg`. Dark terminal backgrounds (luminance < 128) get a light
+/// toolbar so the icons stand out; light backgrounds keep the default dark one.
+fn set_toolbar_contrast(toolbar: &gtk4::Box, bg: skyterm_core::theme::Color) {
+    let lum = 0.2126 * bg.r as f32 + 0.7152 * bg.g as f32 + 0.0722 * bg.b as f32;
+    if lum < 128.0 {
+        toolbar.add_css_class("on-dark");
+    } else {
+        toolbar.remove_css_class("on-dark");
+    }
+}
+
 /// Swap the active color theme globally. `Cell` colors are palette references,
 /// so existing text re-tints on the next render. Bundled font / size, if any,
 /// are applied via [`apply_theme_font`] — `font_path` and `font_size` are
@@ -3310,6 +3343,7 @@ fn apply_theme(state: &Rc<WindowState>, theme: Theme) {
     for tab in state.tabs.borrow().iter() {
         for pane in tab.panes.borrow().iter() {
             *pane.theme.borrow_mut() = theme.clone();
+            set_toolbar_contrast(&pane.toolbar, theme.bg);
             pane.gl_area.queue_render();
         }
     }
@@ -3334,7 +3368,8 @@ fn cycle_theme(state: &Rc<WindowState>, pane: &Rc<Pane>, delta: isize) {
     let next = ((idx + delta) % len + len) % len;
     let theme = themes[next as usize].clone();
     log::info!("cycle theme -> {} (pane)", theme.name);
-    *pane.theme.borrow_mut() = theme;
+    *pane.theme.borrow_mut() = theme.clone();
+    set_toolbar_contrast(&pane.toolbar, theme.bg);
     pane.gl_area.queue_render();
 }
 
@@ -3373,6 +3408,7 @@ fn save_config(state: &Rc<WindowState>) {
         confirm_tab_close: Some(state.confirm_tab_close.get()),
         confirm_pane_close: Some(state.confirm_pane_close.get()),
         confirm_window_close: Some(state.confirm_window_close.get()),
+        show_pane_toolbar: Some(state.show_pane_toolbar.get()),
     };
     if let Err(e) = cfg.save(&path) {
         log::warn!("save config: {e}");
@@ -3786,6 +3822,24 @@ fn open_settings(state: &Rc<WindowState>) {
         });
     }
     behavior.attach(&confirm_win_switch, 1, 8, 1, 1);
+
+    // Show pane toolbar toggle.
+    behavior.attach(&row_label("Show pane toolbar"), 0, 9, 1, 1);
+    let pane_toolbar_switch = gtk4::Switch::new();
+    pane_toolbar_switch.set_active(state.show_pane_toolbar.get());
+    pane_toolbar_switch.set_halign(Align::Start);
+    pane_toolbar_switch.set_tooltip_text(Some(
+        "Show the floating drag/close toolbar on split panes.",
+    ));
+    {
+        let state = state.clone();
+        pane_toolbar_switch.connect_active_notify(move |sw| {
+            state.show_pane_toolbar.set(sw.is_active());
+            update_all_pane_toolbars(&state);
+            save_config(&state);
+        });
+    }
+    behavior.attach(&pane_toolbar_switch, 1, 9, 1, 1);
 
     notebook.append_page(&behavior, Some(&Label::new(Some("Behavior"))));
 

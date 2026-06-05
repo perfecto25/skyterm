@@ -146,6 +146,12 @@ MacOS
     Command+A → l	Focus pane to the right
 ```
 
+Panes can be dragged into new positions or moved to another tab via the Pane toolbar visible on top right corner of each pane.
+
+To move a pane to another tab, drag the pane via Toolbar drag icon and hover over the tab you want to place it, then drop it into a position inside this tab.
+
+Pane toolbars can be disabled in Settings > Behavior or via config file variable 'show_pane_toolbar'
+
 
 #### Copy and paste
 

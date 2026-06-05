@@ -45,6 +45,9 @@ pub struct Config {
     /// Prompt before closing the terminal window. `None` / absent means enabled.
     #[serde(default)]
     pub confirm_window_close: Option<bool>,
+    /// Show the floating drag/close toolbar on split panes. `None` / absent means enabled.
+    #[serde(default)]
+    pub show_pane_toolbar: Option<bool>,
 }
 
 impl Config {
