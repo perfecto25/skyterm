@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// RGBA color, 0-255 per channel. Pure-data, no semantics — the *meaning* of
@@ -100,6 +102,15 @@ pub struct Theme {
     /// 6×6×6 RGB cube; 232-255 are grayscale.
     #[serde(with = "palette_serde")]
     pub palette: [Color; 256],
+    /// Optional theme-bundled font file path. When a theme carrying this is
+    /// selected via Settings, it overrides the global `font_path` (the same
+    /// config field accepts a direct .ttf / .otf / .ttc path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_path: Option<PathBuf>,
+    /// Optional theme-bundled font size (in pixels). Same precedence as
+    /// [`Self::font_path`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<u32>,
 }
 
 impl Theme {
@@ -132,6 +143,8 @@ impl Theme {
             bg: Color::rgb(0x0c, 0x29, 0x3d),
             cursor: Color::rgb(0xaa, 0xaa, 0xaa),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -147,6 +160,8 @@ impl Theme {
             bg: Color::rgb(0x10, 0x10, 0x14),
             cursor: Color::rgb(0xd0, 0xd0, 0xd0),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -159,6 +174,8 @@ impl Theme {
             bg: Color::rgb(0x00, 0x2b, 0x36), // base03
             cursor: Color::rgb(0x83, 0x94, 0x96),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -171,6 +188,8 @@ impl Theme {
             bg: Color::rgb(0xfd, 0xf6, 0xe3), // base3
             cursor: Color::rgb(0x65, 0x7b, 0x83),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -186,6 +205,8 @@ impl Theme {
             bg: Color::rgb(0xfa, 0xfa, 0xfa),
             cursor: Color::rgb(0x20, 0x20, 0x20),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -218,6 +239,8 @@ impl Theme {
             bg: Color::rgb(0x28, 0x2a, 0x36),
             cursor: Color::rgb(0xf8, 0xf8, 0xf2),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -250,6 +273,8 @@ impl Theme {
             bg: Color::rgb(0x1a, 0x0d, 0x2e),
             cursor: Color::rgb(0xbf, 0x9f, 0xff),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -282,6 +307,8 @@ impl Theme {
             bg: Color::rgb(0xfa, 0xfa, 0xfa),
             cursor: Color::rgb(0x52, 0x6f, 0xff),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -314,6 +341,8 @@ impl Theme {
             bg: Color::rgb(0xee, 0xee, 0xee),
             cursor: Color::rgb(0x55, 0x55, 0x55),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -346,6 +375,8 @@ impl Theme {
             bg: Color::rgb(0xf2, 0xe8, 0xd5),
             cursor: Color::rgb(0x8c, 0x6d, 0x3f),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -378,6 +409,8 @@ impl Theme {
             bg: Color::rgb(0x1a, 0x2a, 0x1e),
             cursor: Color::rgb(0x6d, 0xbf, 0x6d),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -410,6 +443,8 @@ impl Theme {
             bg: Color::rgb(0x0d, 0x1f, 0x3c),
             cursor: Color::rgb(0x00, 0xe5, 0xff),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -442,6 +477,8 @@ impl Theme {
             bg: Color::rgb(0xf6, 0xf8, 0xfa),
             cursor: Color::rgb(0x03, 0x66, 0xd6),
             palette,
+            font_path: None,
+            font_size: None,
         }
     }
 
@@ -476,6 +513,89 @@ impl Default for Theme {
     fn default() -> Self {
         Theme::skyterm_blue()
     }
+}
+
+/// Parse a TOML themes file. The expected shape:
+///
+/// ```toml
+/// [themes]
+///
+/// [themes.Latte]
+/// background_color = "#eff1f5"
+/// foreground_color = "#4c4f69"
+/// cursor_color     = "#dc8a78"
+/// palette          = "#5c5f77:#d20f39:..."        # 16 colors, ":"-separated
+/// font_path        = "/usr/share/fonts/Foo.ttf"   # optional, absolute path
+/// font_size        = 14                            # optional, pixels
+/// ```
+///
+/// `font_path` is a direct path to a font file (same shape as `font_path`
+/// in `config.toml`) — anything FreeType can read works: `.ttf`, `.otf`,
+/// `.ttc`. A theme without both `foreground_color` and `background_color`
+/// is skipped. Unknown keys are silently ignored so Terminator-style
+/// profile fields (e.g. `scrollback_infinite`) don't break parsing.
+pub fn parse_toml_themes(text: &str) -> Vec<Theme> {
+    #[derive(serde::Deserialize)]
+    struct File {
+        #[serde(default)]
+        themes: std::collections::BTreeMap<String, Entry>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        #[serde(default)]
+        background_color: Option<String>,
+        #[serde(default)]
+        foreground_color: Option<String>,
+        #[serde(default)]
+        cursor_color: Option<String>,
+        #[serde(default)]
+        palette: Option<String>,
+        #[serde(default)]
+        font_path: Option<PathBuf>,
+        #[serde(default)]
+        font_size: Option<u32>,
+    }
+
+    let file: File = match toml::from_str(text) {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("toml theme parse failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for (name, e) in file.themes {
+        let (Some(fg_s), Some(bg_s)) =
+            (e.foreground_color.as_deref(), e.background_color.as_deref())
+        else {
+            continue;
+        };
+        let (Some(fg), Some(bg)) = (parse_hex(fg_s), parse_hex(bg_s)) else {
+            continue;
+        };
+        let cursor = e.cursor_color.as_deref().and_then(parse_hex).unwrap_or(fg);
+        let mut palette = [Color::rgb(0, 0, 0); 256];
+        for i in 0..256u16 {
+            palette[i as usize] = Color::xterm_256(i as u8);
+        }
+        if let Some(p) = e.palette.as_deref() {
+            if let Some(p16) = parse_palette_16(p) {
+                for (i, c) in p16.iter().enumerate() {
+                    palette[i] = *c;
+                }
+            }
+        }
+        out.push(Theme {
+            name,
+            fg,
+            bg,
+            cursor,
+            palette,
+            font_path: e.font_path,
+            font_size: e.font_size,
+        });
+    }
+    out
 }
 
 /// Parse a Terminator-style theme file. Each `[[name]]` block becomes one
@@ -580,6 +700,8 @@ impl TerminatorBlock {
             bg,
             cursor,
             palette,
+            font_path: None,
+            font_size: None,
         })
     }
 }

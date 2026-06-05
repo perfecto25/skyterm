@@ -33,6 +33,18 @@ pub struct Config {
     /// clipboard automatically. `None` / absent means disabled.
     #[serde(default)]
     pub copy_on_select: Option<bool>,
+    /// Maximum number of tabs allowed. `None` / absent means 20.
+    #[serde(default)]
+    pub tab_max_number: Option<u32>,
+    /// Prompt before closing a tab. `None` / absent means enabled.
+    #[serde(default)]
+    pub confirm_tab_close: Option<bool>,
+    /// Prompt before closing a pane. `None` / absent means enabled.
+    #[serde(default)]
+    pub confirm_pane_close: Option<bool>,
+    /// Prompt before closing the terminal window. `None` / absent means enabled.
+    #[serde(default)]
+    pub confirm_window_close: Option<bool>,
 }
 
 impl Config {

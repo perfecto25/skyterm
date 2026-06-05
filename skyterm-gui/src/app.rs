@@ -33,10 +33,12 @@ const CHORD_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Focus highlight on the wrapper around each pane (2px transparent border
 /// when unfocused reserves the same space so panes don't visibly jump when
-/// focus moves), plus a Fira Code override for the right-click context menu.
-/// `font-family` falls back to a generic monospace if Fira Code isn't
-/// installed, so this is safe everywhere.
-const CSS: &str = "
+/// focus moves), plus a font-family override for the right-click menu and
+/// tab-limit banner so GTK chrome renders in the same monospace face as the
+/// terminal grid. `__FONT_FAMILY__` is substituted at runtime with the active
+/// font's family name (see [`build_css`] / [`apply_chrome_font`]) and the
+/// provider is reloaded on font changes.
+const CSS_TEMPLATE: &str = "
 .pane-wrap {
     border: 2px solid transparent;
 }
@@ -45,8 +47,13 @@ const CSS: &str = "
 }
 popover.menu,
 popover.menu label,
-popover.menu modelbutton {
-    font-family: \"Fira Code\", monospace;
+popover.menu modelbutton,
+popover.menu modelbutton accelerator {
+    font-family: __FONT_FAMILY__, monospace;
+}
+popover.menu modelbutton accelerator {
+    color: rgba(255, 255, 255, 0.55);
+    padding-left: 24px;
 }
 popover.menu scrollbar,
 popover.menu scrollbar trough,
@@ -69,6 +76,61 @@ button.pane-close-btn {
 }
 button.pane-close-btn:hover {
     background: rgba(192, 57, 43, 0.18);
+}
+.pane-toolbar {
+    background: rgba(40, 40, 40, 0.85);
+    border-radius: 14px;
+    padding: 1px 4px;
+    margin: 6px;
+    opacity: 0.10;
+}
+.pane-toolbar.hovered {
+    opacity: 1.0;
+}
+.pane-toolbar button {
+    background: none;
+    border: none;
+    box-shadow: none;
+    padding: 2px 6px;
+    margin: 0;
+    min-width: 16px;
+    min-height: 18px;
+    color: #dddddd;
+}
+.pane-toolbar button:hover {
+    background: rgba(255, 255, 255, 0.16);
+    border-radius: 8px;
+}
+.pane-toolbar button.pane-toolbar-close:hover {
+    background: rgba(192, 57, 43, 0.55);
+    color: #ffffff;
+}
+.pane-drop-highlight {
+    background: rgba(46, 204, 113, 0.30);
+    border: 2px solid rgba(46, 204, 113, 0.95);
+    border-radius: 4px;
+}
+.tab-max-banner {
+    background: rgba(255, 248, 180, 0.88);
+    color: #4a3b00;
+    border-radius: 6px;
+    padding: 10px 16px;
+    margin: 10px;
+    font-family: __FONT_FAMILY__, monospace;
+    font-size: 12px;
+}
+.tab-max-banner-close {
+    color: #4a3b00;
+    padding: 0;
+    min-width: 20px;
+    min-height: 20px;
+}
+.split-dir-btn {
+    font-family: __FONT_FAMILY__, monospace;
+    font-size: 14px;
+    padding: 2px 8px;
+    min-width: 30px;
+    min-height: 26px;
 }
 ";
 
@@ -97,6 +159,10 @@ struct WindowState {
     /// Built-in presets + any user themes discovered in the themes folder.
     /// Settings reads from this list; first entry is the new-install default.
     available_themes: Vec<Theme>,
+    /// Names of themes that came from the user themes folder (as opposed to
+    /// the built-in `Theme::presets()`). Used by menu / Settings to bucket
+    /// these under "Custom" instead of Dark / Light.
+    user_theme_names: std::collections::HashSet<String>,
     /// The toplevel window. Popovers parent here for sizing freedom, not to
     /// the per-pane `GLArea`.
     window: ApplicationWindow,
@@ -121,6 +187,30 @@ struct WindowState {
     click_word_select: Rc<Cell<bool>>,
     /// Whether making a selection copies it to the clipboard automatically.
     copy_on_select: Rc<Cell<bool>>,
+    /// Maximum number of tabs. Default 20; overridable via `tab_max_number` in config.
+    tab_max: Cell<u32>,
+    /// Banner shown in the top-right when the tab limit is reached.
+    tab_max_banner: gtk4::Box,
+    /// Active hide-timer for the tab-max banner. Cancelled and replaced on each show.
+    tab_max_banner_timer: RefCell<Option<glib::SourceId>>,
+    /// Show a confirmation dialog before closing a tab.
+    confirm_tab_close: Cell<bool>,
+    /// Show a confirmation dialog before closing a pane.
+    confirm_pane_close: Cell<bool>,
+    /// Show a confirmation dialog before closing the window via the OS button.
+    confirm_window_close: Cell<bool>,
+    /// Set to `true` just before programmatically closing the window so the
+    /// `close-request` handler lets it through without showing a second dialog.
+    force_close: Cell<bool>,
+    /// The pane that is currently being dragged via the toolbar handle, or
+    /// `None`. Set in `DragSource::prepare`, cleared in `drag-end`. Drop
+    /// targets read this to know which pane to rearrange and to reject
+    /// drops on the source pane itself.
+    dragging: RefCell<Option<Rc<Pane>>>,
+    /// CSS provider for the chrome stylesheet. Held so the font-family of
+    /// menus / banners can be re-substituted when the user picks a different
+    /// terminal font in Settings.
+    css_provider: CssProvider,
 }
 
 struct Tab {
@@ -139,6 +229,15 @@ struct Pane {
     /// pane has the `focused` class added to this widget.
     wrap: gtk4::Box,
     gl_area: GLArea,
+    /// Floating toolbar over the top-right of the gl_area. Hidden when this
+    /// pane is the only one in its tab; shown otherwise. Holds the drag and
+    /// close icons.
+    toolbar: gtk4::Box,
+    /// Translucent green overlay shown during pane drag-and-drop to indicate
+    /// which edge of this pane the drop would land on. Half the pane's size,
+    /// pinned to the corresponding edge via halign/valign. Pointer-transparent
+    /// so it doesn't block the underlying drop-target motion events.
+    drop_highlight: gtk4::Box,
     scrollbar: Scrollbar,
     scroll_adj: Adjustment,
     scroll_syncing: Cell<bool>,
@@ -193,7 +292,9 @@ pub fn on_activate(app: &Application) {
         log::info!("skyterm starting — font {}", font_path.display());
     }
 
-    install_css();
+    let initial_family =
+        font::family_name(&font_path).unwrap_or_else(|_| "monospace".to_string());
+    let css_provider = install_css(&initial_family);
 
     // First-pane atlas just so we can size the initial window sensibly.
     let initial_atlas = match font::build_atlas(&font_path, DEFAULT_FONT_SIZE_PX) {
@@ -212,33 +313,50 @@ pub fn on_activate(app: &Application) {
         .default_height((INITIAL_ROWS as u32 * initial_atlas.cell_h) as i32)
         .build();
 
-    // Themes are needed both for the submenu and for WindowState.
+    // Themes are needed both for the submenu and for WindowState. Built-in
+    // presets first, then any user themes from `~/.config/skyterm/themes/*.toml`.
+    // The names of user themes are tracked separately so the menu and the
+    // Settings dialog can put them in a "Custom" section.
     let mut available_themes: Vec<Theme> = Theme::presets();
-    available_themes.extend(load_user_themes());
+    let user_themes = load_user_themes();
+    let user_theme_names: std::collections::HashSet<String> =
+        user_themes.iter().map(|t| t.name.clone()).collect();
+    available_themes.extend(user_themes);
 
     // Build the two menu variants. They share the splits + clipboard
     // sections (gio::Menu sections are referenced, not copied), so we only
     // need to define them once.
+    // Terminator-style split naming: "Horizontally" = horizontal divider line
+    // = new pane below; "Vertically" = vertical divider line = new pane to the
+    // right. The four directional actions (split-left/right/up/down) used by
+    // the chord keybindings are still registered separately in
+    // `install_pane_actions` but no longer surfaced in the menu.
     let splits = gio::Menu::new();
-    splits.append(Some("Split pane >"), Some("pane.split-right"));
-    splits.append(Some("Split pane ^ "), Some("pane.split-up"));
-    splits.append(Some("New tab"), Some("pane.new-tab"));
+    splits.append(Some("Split Horizontally"), Some("pane.split-horizontal"));
+    splits.append(Some("Split Vertically"),   Some("pane.split-vertical"));
+    splits.append(Some("New Tab"),            Some("pane.new-tab"));
+    splits.append(Some("New Window"),         Some("pane.new-window"));
 
     let clipboard = gio::Menu::new();
     clipboard.append(Some("Copy"), Some("pane.copy"));
     clipboard.append(Some("Paste"), Some("pane.paste"));
     clipboard.append(Some("Select All"), Some("pane.select-all"));
 
-    // Themes submenu — dark and light as labelled sections.
+    // Themes submenu — Dark / Light for built-in presets, Custom (flat) for
+    // user-loaded themes regardless of brightness. Custom is omitted when no
+    // user themes were found.
     let dark_items = gio::Menu::new();
     let light_items = gio::Menu::new();
+    let custom_items = gio::Menu::new();
     for t in &available_themes {
         let item = gio::MenuItem::new(Some(t.name.as_str()), None);
         item.set_action_and_target_value(
             Some("pane.set-theme"),
             Some(&t.name.to_variant()),
         );
-        if t.is_dark() {
+        if user_theme_names.contains(&t.name) {
+            custom_items.append_item(&item);
+        } else if t.is_dark() {
             dark_items.append_item(&item);
         } else {
             light_items.append_item(&item);
@@ -247,6 +365,9 @@ pub fn on_activate(app: &Application) {
     let themes_submenu = gio::Menu::new();
     themes_submenu.append_section(Some("Dark"), &dark_items);
     themes_submenu.append_section(Some("Light"), &light_items);
+    if !user_theme_names.is_empty() {
+        themes_submenu.append_section(Some("Custom"), &custom_items);
+    }
 
     let prefs = gio::Menu::new();
     prefs.append_submenu(Some("Themes"), &themes_submenu);
@@ -279,7 +400,34 @@ pub fn on_activate(app: &Application) {
     notebook.set_scrollable(true);
     notebook.set_show_tabs(false);
     notebook.set_show_border(false);
-    window.set_child(Some(&notebook));
+
+    // Overlay wraps the notebook so we can float the tab-max banner on top.
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&notebook));
+
+    let banner_text = gtk4::Label::new(Some(
+        "Maximum number of tabs has been opened.\n\
+         To change this, edit ~/.config/skyterm/config.toml  (tab_max_number)",
+    ));
+    banner_text.set_hexpand(true);
+    banner_text.set_xalign(0.0);
+
+    let banner_close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+    banner_close_btn.set_has_frame(false);
+    banner_close_btn.add_css_class("flat");
+    banner_close_btn.add_css_class("tab-max-banner-close");
+    banner_close_btn.set_valign(gtk4::Align::Start);
+
+    let tab_max_banner = gtk4::Box::new(Orientation::Horizontal, 12);
+    tab_max_banner.append(&banner_text);
+    tab_max_banner.append(&banner_close_btn);
+    tab_max_banner.set_halign(gtk4::Align::End);
+    tab_max_banner.set_valign(gtk4::Align::Start);
+    tab_max_banner.add_css_class("tab-max-banner");
+    tab_max_banner.set_visible(false);
+    overlay.add_overlay(&tab_max_banner);
+
+    window.set_child(Some(&overlay));
 
     let initial_theme = cfg
         .theme_name
@@ -291,6 +439,11 @@ pub fn on_activate(app: &Application) {
     let blink_phase = Rc::new(Cell::new(true));
     let click_word_select = Rc::new(Cell::new(cfg.click_word_select.unwrap_or(true)));
     let copy_on_select = Rc::new(Cell::new(cfg.copy_on_select.unwrap_or(false)));
+
+    let tab_max = cfg.tab_max_number.unwrap_or(20);
+    let confirm_tab_close = cfg.confirm_tab_close.unwrap_or(true);
+    let confirm_pane_close = cfg.confirm_pane_close.unwrap_or(true);
+    let confirm_window_close = cfg.confirm_window_close.unwrap_or(true);
 
     let state = Rc::new(WindowState {
         tabs: RefCell::new(Vec::new()),
@@ -304,11 +457,62 @@ pub fn on_activate(app: &Application) {
         theme: Rc::new(RefCell::new(initial_theme)),
         font_path: Rc::new(RefCell::new(font_path)),
         available_themes,
+        user_theme_names,
         cursor_blink: cursor_blink.clone(),
         blink_phase: blink_phase.clone(),
         click_word_select: click_word_select.clone(),
         copy_on_select: copy_on_select.clone(),
+        tab_max: Cell::new(tab_max),
+        tab_max_banner,
+        tab_max_banner_timer: RefCell::new(None),
+        confirm_tab_close: Cell::new(confirm_tab_close),
+        confirm_pane_close: Cell::new(confirm_pane_close),
+        confirm_window_close: Cell::new(confirm_window_close),
+        force_close: Cell::new(false),
+        dragging: RefCell::new(None),
+        css_provider,
     });
+
+    // Dismiss button on the tab-max banner.
+    {
+        let state_w = Rc::downgrade(&state);
+        banner_close_btn.connect_clicked(move |_| {
+            if let Some(s) = state_w.upgrade() {
+                s.tab_max_banner.set_visible(false);
+                if let Some(id) = s.tab_max_banner_timer.borrow_mut().take() {
+                    id.remove();
+                }
+            }
+        });
+    }
+
+    // Window close-request (OS title-bar X button). If confirm_window_close is
+    // on, intercept and show a dialog; only close for real when confirmed.
+    // force_close bypasses the dialog when the window is being closed
+    // programmatically after the user already confirmed a tab/pane close.
+    {
+        let state = state.clone();
+        window.connect_close_request(move |_win| {
+            if state.force_close.get() {
+                state.force_close.set(false);
+                return glib::Propagation::Proceed;
+            }
+            if state.confirm_window_close.get() {
+                let state = state.clone();
+                confirm_close(
+                    &state.window.clone(),
+                    "Are you sure you want to close skyterm?",
+                    move || {
+                        state.force_close.set(true);
+                        state.window.close();
+                    },
+                );
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+    }
 
     // Cursor blink tick (500 ms). Only does work when blinking is enabled:
     // flips the phase and re-renders the current tab's panes.
@@ -331,6 +535,7 @@ pub fn on_activate(app: &Application) {
     }
 
     install_pane_actions(&window, &state);
+    install_accelerators(app);
 
     // Tab switch → restore keyboard focus to that tab's last-focused pane.
     {
@@ -346,6 +551,22 @@ pub fn on_activate(app: &Application) {
                 if let Some(p) = t.focused.borrow().clone() {
                     p.gl_area.grab_focus();
                 }
+            }
+        });
+    }
+
+    // Tab drag reorder → keep state.tabs in sync with the notebook page order.
+    {
+        let state = state.clone();
+        notebook.connect_page_reordered(move |_, child, new_pos| {
+            let new_pos = new_pos as usize;
+            let mut tabs = state.tabs.borrow_mut();
+            if let Some(old_pos) = tabs
+                .iter()
+                .position(|t| t.container.upcast_ref::<gtk4::Widget>() == child)
+            {
+                let tab = tabs.remove(old_pos);
+                tabs.insert(new_pos, tab);
             }
         });
     }
@@ -366,22 +587,37 @@ pub fn on_activate(app: &Application) {
     window.present();
 }
 
-/// Register the `pane.split-*` actions on the window. Each one consults
-/// `state.menu_target` (set just before the popover is shown) to figure out
-/// which pane to split, then dispatches to [`split`].
+/// The pane an action should operate on. When a popover is open, that's the
+/// pane it was opened from (`menu_target`); when an action is fired by a
+/// keyboard accelerator with no popover, fall back to the currently focused
+/// pane. Used so registered accelerators work the same way the menu does.
+fn action_target(state: &Rc<WindowState>) -> Option<Rc<Pane>> {
+    state
+        .menu_target
+        .borrow()
+        .clone()
+        .or_else(|| focused_pane(state))
+}
+
+/// Register the `pane.*` actions on the window. Each one resolves a target
+/// pane via [`action_target`] — popover-target when the menu was used,
+/// focused pane otherwise — so the same actions cover both the right-click
+/// menu and the application-level accelerators.
 fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
     let group = gio::SimpleActionGroup::new();
+
+    // Two named splits matching the menu items. "Horizontal" = horizontal
+    // divider = new pane below (SplitDir::Down); "Vertical" = vertical
+    // divider = new pane to the right (SplitDir::Right). Mirrors the
+    // Terminator convention the user is migrating from.
     for (name, dir) in [
-        ("split-right", SplitDir::Right),
-        ("split-left", SplitDir::Left),
-        ("split-up", SplitDir::Up),
-        ("split-down", SplitDir::Down),
+        ("split-horizontal", SplitDir::Down),
+        ("split-vertical", SplitDir::Right),
     ] {
         let action = gio::SimpleAction::new(name, None);
         let state = state.clone();
         action.connect_activate(move |_, _| {
-            let target = state.menu_target.borrow().clone();
-            if let Some(target) = target {
+            if let Some(target) = action_target(&state) {
                 split(&state, &target, dir);
             }
         });
@@ -392,9 +628,8 @@ fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
     {
         let state = state.clone();
         close.connect_activate(move |_, _| {
-            let target = state.menu_target.borrow().clone();
-            if let Some(target) = target {
-                close_pane(&state, &target);
+            if let Some(target) = action_target(&state) {
+                request_close_pane(&state, &target);
             }
         });
     }
@@ -404,7 +639,7 @@ fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
     {
         let state = state.clone();
         copy.connect_activate(move |_, _| {
-            if let Some(target) = state.menu_target.borrow().clone() {
+            if let Some(target) = action_target(&state) {
                 copy_selection(&target);
             }
         });
@@ -415,7 +650,7 @@ fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
     {
         let state = state.clone();
         paste_action.connect_activate(move |_, _| {
-            if let Some(target) = state.menu_target.borrow().clone() {
+            if let Some(target) = action_target(&state) {
                 paste(&target, false);
             }
         });
@@ -426,7 +661,7 @@ fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
     {
         let state = state.clone();
         select_all.connect_activate(move |_, _| {
-            if let Some(target) = state.menu_target.borrow().clone() {
+            if let Some(target) = action_target(&state) {
                 select_all_pane(&target);
             }
         });
@@ -441,6 +676,21 @@ fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
         });
     }
     group.add_action(&new_tab_action);
+
+    // Spin up another top-level skyterm window inside the same `Application`.
+    // Re-entering `on_activate` reuses the activation path the very first
+    // window took, so a new-window window is identical to a freshly-launched
+    // one (fresh config load, fresh tab, its own pane tree).
+    let new_window_action = gio::SimpleAction::new("new-window", None);
+    {
+        let state = state.clone();
+        new_window_action.connect_activate(move |_, _| {
+            if let Some(app) = state.window.application() {
+                on_activate(&app);
+            }
+        });
+    }
+    group.add_action(&new_window_action);
 
     let settings_action = gio::SimpleAction::new("settings", None);
     {
@@ -475,14 +725,44 @@ fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
                 .find(|t| t.name == name)
                 .cloned()
             {
-                *pane.theme.borrow_mut() = theme;
+                // Colors remain per-pane (the right-click set-theme is a
+                // per-pane override). Font / size, however, are global state
+                // — if the theme bundles them, apply globally so the user
+                // actually sees the font swap they asked for.
+                *pane.theme.borrow_mut() = theme.clone();
                 pane.gl_area.queue_render();
+                apply_theme_font(&state, &theme);
             }
         });
     }
     group.add_action(&set_theme);
 
     window.insert_action_group("pane", Some(&group));
+}
+
+/// Register application-level keyboard accelerators for the menu actions.
+/// GTK4 auto-renders the accel string next to the corresponding menu items
+/// (in a dimmed colour, Terminator-style), and routes the keypress to the
+/// `pane.*` action group on the window. Uses `<Primary>` so the modifier
+/// resolves to Ctrl on Linux/Windows and ⌘ on macOS.
+fn install_accelerators(app: &Application) {
+    let bindings: &[(&str, &[&str])] = &[
+        // Splits + new tab — Terminator-compatible chords.
+        ("pane.split-horizontal", &["<Primary><Shift>o"]),
+        ("pane.split-vertical",   &["<Primary><Shift>e"]),
+        ("pane.new-tab",          &["<Primary><Shift>t"]),
+        // Clipboard. The same chords are also handled directly in
+        // `wire_pane`'s key controller; the app-level binding takes
+        // precedence and dispatches through `action_target` instead, which
+        // routes to the focused pane just like the menu path does.
+        ("pane.copy",             &["<Primary><Shift>c"]),
+        ("pane.paste",            &["<Primary><Shift>v"]),
+        ("pane.select-all",       &["<Primary><Shift>a"]),
+        ("pane.close",            &["<Primary><Shift>w"]),
+    ];
+    for (action, keys) in bindings {
+        app.set_accels_for_action(action, keys);
+    }
 }
 
 /// The currently-active tab, or `None` if the notebook has no pages (window
@@ -577,9 +857,50 @@ fn focus_direction(state: &Rc<WindowState>, dir: SplitDir) {
     }
 }
 
+/// Show a modal confirmation dialog with "Cancel" and "Close" buttons. Calls
+/// `on_confirm` only if the user clicks Close.
+fn confirm_close(
+    window: &ApplicationWindow,
+    message: &str,
+    on_confirm: impl FnOnce() + 'static,
+) {
+    let dialog = gtk4::AlertDialog::builder()
+        .message(message)
+        .build();
+    dialog.set_buttons(&["Cancel", "Close"]);
+    dialog.set_cancel_button(0);
+    dialog.set_default_button(0);
+    dialog.choose(Some(window), None::<&gio::Cancellable>, move |result| {
+        if result == Ok(1) {
+            on_confirm();
+        }
+    });
+}
+
+/// Show the tab-limit banner in the top-right corner and hide it after 15 s.
+/// Calling this while the banner is already visible resets the 15-second timer.
+fn show_tab_max_banner(state: &Rc<WindowState>) {
+    state.tab_max_banner.set_visible(true);
+    if let Some(id) = state.tab_max_banner_timer.borrow_mut().take() {
+        id.remove();
+    }
+    let state_w = Rc::downgrade(state);
+    let id = glib::timeout_add_local_once(Duration::from_secs(15), move || {
+        if let Some(s) = state_w.upgrade() {
+            s.tab_max_banner.set_visible(false);
+            *s.tab_max_banner_timer.borrow_mut() = None;
+        }
+    });
+    *state.tab_max_banner_timer.borrow_mut() = Some(id);
+}
+
 /// Spawn a new tab with one fresh pane and make it active. Returns false if
-/// PTY / atlas / GLArea setup failed.
+/// the tab limit is reached or PTY / atlas / GLArea setup failed.
 fn new_tab(state: &Rc<WindowState>) -> bool {
+    if state.tabs.borrow().len() >= state.tab_max.get() as usize {
+        show_tab_max_banner(state);
+        return false;
+    }
     let tab = match make_tab(state.clone(), INITIAL_COLS, INITIAL_ROWS) {
         Some(t) => t,
         None => return false,
@@ -587,12 +908,15 @@ fn new_tab(state: &Rc<WindowState>) -> bool {
     let page = state
         .notebook
         .append_page(&tab.container, Some(&tab.tab_label));
+    state.notebook.set_tab_reorderable(&tab.container, true);
     state.tabs.borrow_mut().push(tab.clone());
     state.notebook.set_show_tabs(state.tabs.borrow().len() > 1);
     state.notebook.set_current_page(Some(page));
     if let Some(p) = tab.panes.borrow().first().cloned() {
         focus_pane(state, &p);
     }
+    // Tab count changed — sole-pane tabs may now need to show their toolbar.
+    update_all_pane_toolbars(state);
     true
 }
 
@@ -623,6 +947,8 @@ fn make_tab(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Tab>> {
     close_btn.add_css_class("flat");
 
     let tab_label = gtk4::Box::new(Orientation::Horizontal, 6);
+    tab_label.set_size_request(220, -1);
+    title_label.set_hexpand(true);
     tab_label.append(&title_label);
     tab_label.append(&title_entry);
     tab_label.append(&close_btn);
@@ -720,10 +1046,84 @@ fn make_tab(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Tab>> {
         let state = state.clone();
         let tab_w = Rc::downgrade(&tab);
         close_btn.connect_clicked(move |_| {
-            if let Some(t) = tab_w.upgrade() {
+            let Some(t) = tab_w.upgrade() else { return };
+            if state.confirm_tab_close.get() {
+                let state = state.clone();
+                confirm_close(
+                    &state.window.clone(),
+                    "Are you sure you want to close this tab?",
+                    move || {
+                        state.force_close.set(true);
+                        close_tab(&state, &t);
+                    },
+                );
+            } else {
                 close_tab(&state, &t);
             }
         });
+    }
+
+    // Tab-strip drop target. While a pane is being dragged, hovering this
+    // tab's label switches the notebook to this tab after a short delay so
+    // the user can drop onto one of its panes. The drop itself is refused
+    // (`DragAction::empty()` from `accept`); the user is expected to land on
+    // a real pane below. Without the delay, brushing the cursor across the
+    // tab strip would thrash through every tab it passes over.
+    {
+        let state_w = Rc::downgrade(&state);
+        let tab_w = Rc::downgrade(&tab);
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let tab_drop = gtk4::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
+        // We never want a drop to *land* on the tab label, only to use enter
+        // as a hover trigger. Reject any incoming drag value.
+        tab_drop.connect_accept(|_, _| false);
+        {
+            let pending = pending.clone();
+            let state_w = state_w.clone();
+            let tab_w = tab_w.clone();
+            tab_drop.connect_enter(move |_, _, _| {
+                let (Some(state), Some(tab)) = (state_w.upgrade(), tab_w.upgrade())
+                else {
+                    return gdk::DragAction::empty();
+                };
+                if state.dragging.borrow().is_none() {
+                    return gdk::DragAction::empty();
+                }
+                if let Some(id) = pending.borrow_mut().take() {
+                    id.remove();
+                }
+                let state_w2 = Rc::downgrade(&state);
+                let tab_w2 = Rc::downgrade(&tab);
+                let pending2 = pending.clone();
+                let id = glib::timeout_add_local_once(
+                    Duration::from_millis(250),
+                    move || {
+                        *pending2.borrow_mut() = None;
+                        let (Some(state), Some(tab)) =
+                            (state_w2.upgrade(), tab_w2.upgrade())
+                        else {
+                            return;
+                        };
+                        if let Some(idx) = state.notebook.page_num(&tab.container) {
+                            if state.notebook.current_page() != Some(idx) {
+                                state.notebook.set_current_page(Some(idx));
+                            }
+                        }
+                    },
+                );
+                *pending.borrow_mut() = Some(id);
+                gdk::DragAction::empty()
+            });
+        }
+        {
+            let pending = pending.clone();
+            tab_drop.connect_leave(move |_| {
+                if let Some(id) = pending.borrow_mut().take() {
+                    id.remove();
+                }
+            });
+        }
+        tab.tab_label.add_controller(tab_drop);
     }
 
     wire_pane(&state, &pane);
@@ -756,6 +1156,9 @@ fn close_tab(state: &Rc<WindowState>, tab: &Rc<Tab>) {
         return;
     }
     state.notebook.set_show_tabs(remaining > 1);
+    // Tab count just dropped — a tab that previously showed its toolbar only
+    // because there were other tabs may now collapse it.
+    update_all_pane_toolbars(state);
 }
 
 /// Write the embedded `skyterm.svg` to the user's icon theme search path and
@@ -796,19 +1199,38 @@ fn install_app_icon() {
     }
 }
 
-fn install_css() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let provider = CssProvider::new();
-        provider.load_from_string(CSS);
-        if let Some(display) = gdk::Display::default() {
-            gtk4::style_context_add_provider_for_display(
-                &display,
-                &provider,
-                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
-        }
-    });
+/// Substitute the configured terminal font's family name into [`CSS_TEMPLATE`]
+/// so the menu / banner / split buttons render in the same face as the grid.
+fn build_css(family: &str) -> String {
+    // CSS strings are quoted to handle multi-word names ("DejaVu Sans Mono").
+    let quoted = format!("\"{}\"", family.replace('"', ""));
+    CSS_TEMPLATE.replace("__FONT_FAMILY__", &quoted)
+}
+
+/// Create the chrome CSS provider, register it with the default display, and
+/// load it with the initial font family. The provider is returned so it can
+/// be re-loaded later (see [`apply_chrome_font`]) when the user picks a
+/// different font in Settings.
+fn install_css(family: &str) -> CssProvider {
+    let provider = CssProvider::new();
+    provider.load_from_string(&build_css(family));
+    if let Some(display) = gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+    provider
+}
+
+/// Re-substitute the font family into the chrome stylesheet. Cheap — just
+/// reloads the provider's string source; no extra `add_provider` call needed,
+/// since the same provider remains registered with the display.
+fn apply_chrome_font(state: &Rc<WindowState>) {
+    let path = state.font_path.borrow().clone();
+    let family = font::family_name(&path).unwrap_or_else(|_| "monospace".to_string());
+    state.css_provider.load_from_string(&build_css(&family));
 }
 
 /// Build a fresh pane: spawn a PTY, build a GLArea + scrollbar, hook up the
@@ -857,8 +1279,71 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
     };
     let rx = pty_handle.rx.clone();
 
+    // Floating toolbar with drag handle + close button. Pinned to top-right of
+    // the pane via halign/valign. Hidden by default; `update_pane_toolbars`
+    // shows it whenever the tab has more than one pane.
+    let drag_btn = gtk4::Button::new();
+    drag_btn.set_label("\u{22EF}"); // midline horizontal ellipsis
+    drag_btn.set_tooltip_text(Some("Drag this pane to a new position"));
+    drag_btn.set_focusable(false);
+    drag_btn.set_can_focus(false);
+
+    let close_btn = gtk4::Button::new();
+    close_btn.set_label("\u{2715}"); // multiplication x
+    close_btn.set_tooltip_text(Some("Close pane"));
+    close_btn.set_focusable(false);
+    close_btn.set_can_focus(false);
+    close_btn.add_css_class("pane-toolbar-close");
+
+    let toolbar = gtk4::Box::new(Orientation::Horizontal, 0);
+    toolbar.add_css_class("pane-toolbar");
+    toolbar.set_halign(gtk4::Align::End);
+    toolbar.set_valign(gtk4::Align::Start);
+    toolbar.append(&drag_btn);
+    toolbar.append(&close_btn);
+    toolbar.set_visible(false);
+
+    // Hover toggles the `hovered` CSS class for the 10% → 100% opacity swap.
+    let motion = gtk4::EventControllerMotion::new();
+    {
+        let toolbar_w = toolbar.downgrade();
+        motion.connect_enter(move |_, _, _| {
+            if let Some(t) = toolbar_w.upgrade() {
+                t.add_css_class("hovered");
+            }
+        });
+    }
+    {
+        let toolbar_w = toolbar.downgrade();
+        motion.connect_leave(move |_| {
+            if let Some(t) = toolbar_w.upgrade() {
+                t.remove_css_class("hovered");
+            }
+        });
+    }
+    toolbar.add_controller(motion);
+
+    // Drop-edge highlight (green half-pane rectangle, shown during a drag).
+    // can_target=false so the highlight is transparent to pointer picking —
+    // otherwise it'd block the `DropTarget` motion events on the gl_area
+    // underneath and the cursor would "stick".
+    let drop_highlight = gtk4::Box::new(Orientation::Horizontal, 0);
+    drop_highlight.add_css_class("pane-drop-highlight");
+    drop_highlight.set_visible(false);
+    drop_highlight.set_can_target(false);
+    drop_highlight.set_focusable(false);
+
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&gl_area));
+    // Highlight first, toolbar second — toolbar must stay on top so the close
+    // button is clickable even while a drop highlight is showing.
+    overlay.add_overlay(&drop_highlight);
+    overlay.add_overlay(&toolbar);
+    overlay.set_hexpand(true);
+    overlay.set_vexpand(true);
+
     let inner = gtk4::Box::new(Orientation::Horizontal, 0);
-    inner.append(&gl_area);
+    inner.append(&overlay);
     inner.append(&scrollbar);
 
     let wrap = gtk4::Box::new(Orientation::Vertical, 0);
@@ -870,6 +1355,8 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
     let pane = Rc::new(Pane {
         wrap,
         gl_area,
+        toolbar,
+        drop_highlight,
         scrollbar,
         scroll_adj,
         scroll_syncing: Cell::new(false),
@@ -888,6 +1375,58 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
         click_state: Cell::new((0, 0, 0, 0)),
         _child: RefCell::new(pty_handle.child),
     });
+
+    {
+        let state = state.clone();
+        let pane_w = Rc::downgrade(&pane);
+        close_btn.connect_clicked(move |_| {
+            if let Some(p) = pane_w.upgrade() {
+                request_close_pane(&state, &p);
+            }
+        });
+    }
+
+    // Drag source on the `⋯` toolbar button. The drag content is a placeholder
+    // string ("skyterm-pane") only to satisfy GTK's content-type negotiation —
+    // the actual source pane is held in `state.dragging` so drop targets can
+    // recover the full `Rc<Pane>`. Prepare refuses to start the drag when the
+    // pane is alone in its tab (nowhere to rearrange to).
+    {
+        let drag_source = gtk4::DragSource::new();
+        drag_source.set_actions(gdk::DragAction::MOVE);
+        {
+            let state = state.clone();
+            let pane_w = Rc::downgrade(&pane);
+            drag_source.connect_prepare(move |_, _, _| {
+                let p = pane_w.upgrade()?;
+                let tab = tab_of_pane(&state, &p)?;
+                // Refuse only when the entire window has nowhere to drop:
+                // a single pane in a single tab. With 2+ tabs we still allow
+                // a sole-pane drag because the user can cross tabs.
+                if tab.panes.borrow().len() < 2 && state.tabs.borrow().len() < 2 {
+                    return None;
+                }
+                *state.dragging.borrow_mut() = Some(p);
+                Some(gdk::ContentProvider::for_value(&"skyterm-pane".to_value()))
+            });
+        }
+        {
+            let state = state.clone();
+            drag_source.connect_drag_end(move |_, _, _| {
+                // Clears even if the drop didn't fire (cancelled, escape, etc.)
+                // so a future drag doesn't see stale state, and hides any
+                // lingering drop highlight that DropTarget::leave didn't catch
+                // (e.g. cancellation while the cursor was still over a target).
+                *state.dragging.borrow_mut() = None;
+                for tab in state.tabs.borrow().iter() {
+                    for p in tab.panes.borrow().iter() {
+                        p.drop_highlight.set_visible(false);
+                    }
+                }
+            });
+        }
+        drag_btn.add_controller(drag_source);
+    }
 
     // GL unrealize — drop the renderer *while the old context is still
     // current*. Splits unparent and reparent the pane's GLArea, which makes
@@ -1365,6 +1904,65 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
         pane.gl_area.add_controller(drag);
     }
 
+    // Drop target for pane rearrangement. The DragSource lives on the `⋯`
+    // toolbar button of some *other* pane; this target receives motion/drop
+    // events when that drag enters this pane's GLArea. Motion picks an edge
+    // by 4-quadrant diagonal split and lights up the green highlight; drop
+    // restructures the Paned tree so the source becomes a new split on that
+    // edge of this pane.
+    {
+        let state = state.clone();
+        let pane_w = Rc::downgrade(pane);
+        let drop_target = gtk4::DropTarget::new(glib::Type::STRING, gdk::DragAction::MOVE);
+        {
+            let state = state.clone();
+            let pane_w = pane_w.clone();
+            drop_target.connect_motion(move |_, x, y| {
+                let Some(p) = pane_w.upgrade() else {
+                    return gdk::DragAction::empty();
+                };
+                let src = state.dragging.borrow().clone();
+                let Some(src) = src else {
+                    return gdk::DragAction::empty();
+                };
+                // Refuse self-drops; cross-tab drops are now supported (the
+                // user crosses tabs via the tab-strip hover target).
+                if Rc::ptr_eq(&p, &src) {
+                    p.drop_highlight.set_visible(false);
+                    return gdk::DragAction::empty();
+                }
+                let dir = compute_drop_dir(&p, x, y);
+                show_drop_highlight(&p, dir);
+                gdk::DragAction::MOVE
+            });
+        }
+        {
+            let pane_w = pane_w.clone();
+            drop_target.connect_leave(move |_| {
+                if let Some(p) = pane_w.upgrade() {
+                    p.drop_highlight.set_visible(false);
+                }
+            });
+        }
+        {
+            let state = state.clone();
+            let pane_w = pane_w.clone();
+            drop_target.connect_drop(move |_, _value, x, y| {
+                let Some(p) = pane_w.upgrade() else { return false };
+                p.drop_highlight.set_visible(false);
+                let src = state.dragging.borrow_mut().take();
+                let Some(src) = src else { return false };
+                if Rc::ptr_eq(&p, &src) {
+                    return false;
+                }
+                let dir = compute_drop_dir(&p, x, y);
+                rearrange_pane(&state, &src, &p, dir);
+                true
+            });
+        }
+        pane.gl_area.add_controller(drop_target);
+    }
+
     // Middle-click → primary-selection paste.
     {
         let pane_w = Rc::downgrade(pane);
@@ -1576,6 +2174,13 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
                 // `t` opens a new tab.
                 if matches!(keyval, gdk::Key::t | gdk::Key::T) {
                     new_tab(&state);
+                    return glib::Propagation::Stop;
+                }
+                // `n` opens a new top-level window.
+                if matches!(keyval, gdk::Key::n | gdk::Key::N) {
+                    if let Some(app) = state.window.application() {
+                        on_activate(&app);
+                    }
                     return glib::Propagation::Stop;
                 }
                 // `o` cycles focus to the next pane in the current tab.
@@ -1837,9 +2442,289 @@ fn split(state: &Rc<WindowState>, focused: &Rc<Pane>, dir: SplitDir) {
     // the tab through every callsite.)
     if let Some(tab) = tab_of_pane(state, focused) {
         tab.panes.borrow_mut().push(new_pane.clone());
+        update_pane_toolbars(state, &tab);
     }
     wire_pane(state, &new_pane);
     focus_pane(state, &new_pane);
+}
+
+/// Close a pane, optionally behind the confirmation dialog when
+/// `confirm_pane_close` is set. Used by the right-click menu's Close action
+/// and the floating toolbar's X button.
+fn request_close_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
+    if state.confirm_pane_close.get() {
+        let state = state.clone();
+        let pane = pane.clone();
+        confirm_close(
+            &state.window.clone(),
+            "Are you sure you want to close this pane?",
+            move || {
+                state.force_close.set(true);
+                close_pane(&state, &pane);
+            },
+        );
+    } else {
+        close_pane(state, pane);
+    }
+}
+
+/// Pick the drop edge for a `(x, y)` pointer position inside a pane: the pane
+/// is sliced into four triangles by its diagonals; whichever triangle the
+/// cursor is in determines which edge the source pane snaps to. Matches
+/// Terminator's drop-target feedback.
+fn compute_drop_dir(pane: &Pane, x: f64, y: f64) -> SplitDir {
+    let w = pane.gl_area.width() as f64;
+    let h = pane.gl_area.height() as f64;
+    // Normalize to (-0.5, 0.5); compare absolute distances from the center on
+    // each axis so the larger one wins (= we're closer to that edge pair).
+    let dx = if w > 0.0 { x / w - 0.5 } else { 0.0 };
+    let dy = if h > 0.0 { y / h - 0.5 } else { 0.0 };
+    if dx.abs() > dy.abs() {
+        if dx < 0.0 { SplitDir::Left } else { SplitDir::Right }
+    } else if dy < 0.0 {
+        SplitDir::Up
+    } else {
+        SplitDir::Down
+    }
+}
+
+/// Position and show the green drop-target highlight on `pane` for direction
+/// `dir`. Covers half the pane along the appropriate axis.
+///
+/// Implementation note: rather than `valign/halign = Start/End` + a
+/// `size_request`, this uses `Fill + Fill` with a one-sided margin that pushes
+/// the opposite edge inward. `valign=End` + height_request was unreliable in
+/// `GtkOverlay`'s child allocation (the bottom-half case rendered with zero
+/// size on some GTK builds); Fill + margins is unambiguous and produces a
+/// half-pane rectangle every time.
+fn show_drop_highlight(pane: &Pane, dir: SplitDir) {
+    let w = pane.gl_area.width();
+    let h = pane.gl_area.height();
+    let hl = &pane.drop_highlight;
+    hl.set_halign(gtk4::Align::Fill);
+    hl.set_valign(gtk4::Align::Fill);
+    hl.set_size_request(-1, -1);
+    // Clear any margin from the previous direction so transitions like
+    // Up→Down don't leave both margin_top and margin_bottom set.
+    hl.set_margin_top(0);
+    hl.set_margin_bottom(0);
+    hl.set_margin_start(0);
+    hl.set_margin_end(0);
+    match dir {
+        SplitDir::Left => hl.set_margin_end((w / 2).max(0)),
+        SplitDir::Right => hl.set_margin_start((w / 2).max(0)),
+        SplitDir::Up => hl.set_margin_bottom((h / 2).max(0)),
+        SplitDir::Down => hl.set_margin_top((h / 2).max(0)),
+    }
+    hl.set_visible(true);
+}
+
+/// Detach `pane.wrap` from its current parent so it can be re-attached
+/// elsewhere. Two cases:
+///
+/// 1. Parent is a `Paned` (pane shares its tab with siblings) — collapse the
+///    `Paned` so the sibling takes its place, as `close_pane` does.
+/// 2. Parent is a `gtk4::Box` (pane is the sole pane in its tab) — just
+///    remove it from the box; the tab is now empty and the caller is
+///    responsible for closing it.
+///
+/// Leaves the `Pane` itself alive (doesn't touch the tab's `panes` vec or
+/// focus). Returns true on success.
+fn detach_pane_widget(pane: &Rc<Pane>) -> bool {
+    let wrap = pane.wrap.clone();
+    let Some(parent) = wrap.parent() else { return false };
+    if let Ok(b) = parent.clone().downcast::<gtk4::Box>() {
+        // Sole pane in its tab — just unparent.
+        b.remove(&wrap);
+        return true;
+    }
+    let Ok(parent_paned) = parent.downcast::<Paned>() else { return false };
+    let wrap_widget: gtk4::Widget = wrap.clone().upcast();
+    let in_start = parent_paned
+        .start_child()
+        .map(|c| c == wrap_widget)
+        .unwrap_or(false);
+    let sibling = if in_start {
+        parent_paned.end_child()
+    } else {
+        parent_paned.start_child()
+    };
+    let Some(sibling) = sibling else { return false };
+    let Some(grandparent) = parent_paned.parent() else { return false };
+
+    // Detach both children of the dying Paned. wrap becomes orphaned, ready
+    // for re-attachment by the caller.
+    parent_paned.set_start_child(gtk4::Widget::NONE);
+    parent_paned.set_end_child(gtk4::Widget::NONE);
+
+    if let Ok(b) = grandparent.clone().downcast::<gtk4::Box>() {
+        b.remove(&parent_paned);
+        b.append(&sibling);
+    } else if let Ok(gp) = grandparent.downcast::<Paned>() {
+        let paned_widget: gtk4::Widget = parent_paned.clone().upcast();
+        let gp_in_start = gp
+            .start_child()
+            .map(|c| c == paned_widget)
+            .unwrap_or(false);
+        if gp_in_start {
+            gp.set_start_child(gtk4::Widget::NONE);
+            gp.set_start_child(Some(&sibling));
+        } else {
+            gp.set_end_child(gtk4::Widget::NONE);
+            gp.set_end_child(Some(&sibling));
+        }
+    } else {
+        return false;
+    }
+    true
+}
+
+/// Insert `src.wrap` next to `dst.wrap` in the widget tree, oriented per
+/// `dir`. Wraps both into a new `Paned` that replaces `dst.wrap` in its
+/// current parent — mirroring the layout part of `split`, but using an
+/// already-existing source pane rather than creating one.
+fn attach_pane_next_to(src: &Rc<Pane>, dst: &Rc<Pane>, dir: SplitDir) -> bool {
+    let dst_wrap = dst.wrap.clone();
+    let Some(parent) = dst_wrap.parent() else { return false };
+    let orientation = match dir {
+        SplitDir::Left | SplitDir::Right => Orientation::Horizontal,
+        SplitDir::Up | SplitDir::Down => Orientation::Vertical,
+    };
+    let paned = Paned::new(orientation);
+    paned.set_resize_start_child(true);
+    paned.set_resize_end_child(true);
+    paned.set_shrink_start_child(false);
+    paned.set_shrink_end_child(false);
+    paned.set_hexpand(true);
+    paned.set_vexpand(true);
+
+    let half = match orientation {
+        Orientation::Horizontal => dst_wrap.width() / 2,
+        _ => dst_wrap.height() / 2,
+    };
+    if half > 0 {
+        paned.set_position(half);
+    }
+
+    let dst_widget: gtk4::Widget = dst_wrap.clone().upcast();
+    if let Ok(b) = parent.clone().downcast::<gtk4::Box>() {
+        b.remove(&dst_wrap);
+        b.append(&paned);
+    } else if let Ok(pp) = parent.downcast::<Paned>() {
+        let in_start = pp
+            .start_child()
+            .map(|c| c == dst_widget)
+            .unwrap_or(false);
+        if in_start {
+            pp.set_start_child(gtk4::Widget::NONE);
+            pp.set_start_child(Some(&paned));
+        } else {
+            pp.set_end_child(gtk4::Widget::NONE);
+            pp.set_end_child(Some(&paned));
+        }
+    } else {
+        return false;
+    }
+
+    match dir {
+        SplitDir::Right | SplitDir::Down => {
+            paned.set_start_child(Some(&dst_wrap));
+            paned.set_end_child(Some(&src.wrap));
+        }
+        SplitDir::Left | SplitDir::Up => {
+            paned.set_start_child(Some(&src.wrap));
+            paned.set_end_child(Some(&dst_wrap));
+        }
+    }
+
+    // Reflow both panes when the new divider is dragged.
+    let a_w = Rc::downgrade(src);
+    let b_w = Rc::downgrade(dst);
+    paned.connect_notify_local(Some("position"), move |_, _| {
+        if let Some(p) = a_w.upgrade() {
+            p.gl_area.queue_render();
+            schedule_reflow(&p);
+        }
+        if let Some(p) = b_w.upgrade() {
+            p.gl_area.queue_render();
+            schedule_reflow(&p);
+        }
+    });
+    true
+}
+
+/// Move `src` so it becomes a new split on edge `dir` of `dst`. Supports
+/// both same-tab rearranges and cross-tab moves (drag a pane onto a different
+/// tab, drop on one of its panes). No-op when the two panes are the same or
+/// either is not currently tracked. If the source's tab ends up empty after
+/// a cross-tab move, that tab is closed automatically.
+fn rearrange_pane(state: &Rc<WindowState>, src: &Rc<Pane>, dst: &Rc<Pane>, dir: SplitDir) {
+    if Rc::ptr_eq(src, dst) {
+        return;
+    }
+    let Some(src_tab) = tab_of_pane(state, src) else { return };
+    let Some(dst_tab) = tab_of_pane(state, dst) else { return };
+
+    if !detach_pane_widget(src) {
+        return;
+    }
+    if !attach_pane_next_to(src, dst, dir) {
+        log::warn!("rearrange: attach failed after detach — pane is orphaned");
+        return;
+    }
+
+    let cross_tab = !Rc::ptr_eq(&src_tab, &dst_tab);
+    if cross_tab {
+        // Move membership: out of src_tab's panes vec, into dst_tab's. If
+        // src was src_tab's focused pane, promote the next remaining pane
+        // (or `None`, which `focus_pane` below will sort out).
+        src_tab.panes.borrow_mut().retain(|p| !Rc::ptr_eq(p, src));
+        let src_was_focused = src_tab
+            .focused
+            .borrow()
+            .as_ref()
+            .map(|f| Rc::ptr_eq(f, src))
+            .unwrap_or(false);
+        if src_was_focused {
+            let next = src_tab.panes.borrow().first().cloned();
+            *src_tab.focused.borrow_mut() = next;
+        }
+        dst_tab.panes.borrow_mut().push(src.clone());
+
+        if src_tab.panes.borrow().is_empty() {
+            // Source tab is now empty — close it. `close_tab` already calls
+            // `update_all_pane_toolbars`, which also covers dst_tab.
+            close_tab(state, &src_tab);
+        } else {
+            update_pane_toolbars(state, &src_tab);
+            update_pane_toolbars(state, &dst_tab);
+        }
+    }
+
+    focus_pane(state, src);
+}
+
+/// Show the floating toolbar on every pane in a tab when there is more than
+/// one pane in the tab, OR when there is more than one tab in the window —
+/// the latter so a sole-pane tab still has a drag handle the user can grab
+/// to move the pane across tabs. Hidden only on the "one pane, one tab" case
+/// where there's nowhere to drag to and closing would empty the window.
+fn update_pane_toolbars(state: &Rc<WindowState>, tab: &Rc<Tab>) {
+    let tabs_count = state.tabs.borrow().len();
+    let panes = tab.panes.borrow();
+    let show = panes.len() > 1 || tabs_count > 1;
+    for p in panes.iter() {
+        p.toolbar.set_visible(show);
+    }
+}
+
+/// Refresh toolbar visibility on every tab. Needed when the tab count itself
+/// changes (new tab, close tab, cross-tab drag), since the per-tab decision
+/// depends on the global tab count too.
+fn update_all_pane_toolbars(state: &Rc<WindowState>) {
+    for tab in state.tabs.borrow().iter() {
+        update_pane_toolbars(state, tab);
+    }
 }
 
 /// Tear down a pane: unhook it from the widget tree (collapsing its parent
@@ -1939,6 +2824,7 @@ fn close_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
             focus_pane(state, &p);
         }
     }
+    update_pane_toolbars(state, &tab);
 }
 
 /// Characters that count as part of a "word" for double-click selection.
@@ -2310,9 +3196,11 @@ fn sync_scrollbar(pane: &Pane) {
     pane.scrollbar.set_visible(sb > 0);
 }
 
-/// Walk `~/.config/skyterm/themes/` and parse every file inside as a
-/// Terminator-style theme config. Files with no parseable themes are
-/// silently skipped (a non-theme stray file shouldn't break startup).
+/// Walk `~/.config/skyterm/themes/` and parse every `*.toml` file inside as
+/// a skyterm theme config (see [`parse_toml_themes`] for the expected
+/// `[themes.Name]` table layout). Result is sorted alphabetically by theme
+/// name for stable menu order. Files with no parseable themes are silently
+/// skipped so a stray non-theme file in the directory can't break startup.
 fn load_user_themes() -> Vec<Theme> {
     let Some(dir) = user_themes_dir() else {
         return Vec::new();
@@ -2328,11 +3216,21 @@ fn load_user_themes() -> Vec<Theme> {
         if !path.is_file() {
             continue;
         }
+        // Restrict to *.toml so unrelated files in the dir don't get parsed.
+        let is_toml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("toml"))
+            .unwrap_or(false);
+        if !is_toml {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        out.extend(skyterm_core::theme::parse_terminator_themes(&text));
+        out.extend(skyterm_core::theme::parse_toml_themes(&text));
     }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     if !out.is_empty() {
         log::info!(
             "loaded {} user theme(s) from {}",
@@ -2366,6 +3264,9 @@ fn apply_font_family_all(state: &Rc<WindowState>, new_path: PathBuf) {
         return;
     }
     *state.font_path.borrow_mut() = new_path.clone();
+    // Reload the chrome stylesheet so popovers / banners pick up the new
+    // family alongside the grid.
+    apply_chrome_font(state);
     // Pane.font_path is a clone of the same Rc, so it already sees the new
     // value. We just need each pane to re-rasterize its atlas at the
     // current size.
@@ -2386,8 +3287,25 @@ fn apply_font_family_all(state: &Rc<WindowState>, new_path: PathBuf) {
     }
 }
 
-/// Swap the active color theme. `Cell` colors are palette references, so
-/// existing text re-tints on the next render.
+/// Apply only the font-related fields a theme might carry (`font_path`,
+/// `font_size`). Used by both the global Settings apply path and the
+/// per-pane right-click apply path so a theme that bundles a font actually
+/// swaps the font regardless of where the user picked it from. Fields that
+/// the theme doesn't set are left alone. Invalid font paths fall through
+/// silently via the atlas-build error path in `apply_font_family_all`.
+fn apply_theme_font(state: &Rc<WindowState>, theme: &Theme) {
+    if let Some(path) = theme.font_path.clone() {
+        apply_font_family_all(state, path);
+    }
+    if let Some(size) = theme.font_size {
+        apply_font_size_all(state, size);
+    }
+}
+
+/// Swap the active color theme globally. `Cell` colors are palette references,
+/// so existing text re-tints on the next render. Bundled font / size, if any,
+/// are applied via [`apply_theme_font`] — `font_path` and `font_size` are
+/// global, not per-pane.
 fn apply_theme(state: &Rc<WindowState>, theme: Theme) {
     *state.theme.borrow_mut() = theme.clone();
     for tab in state.tabs.borrow().iter() {
@@ -2396,6 +3314,7 @@ fn apply_theme(state: &Rc<WindowState>, theme: Theme) {
             pane.gl_area.queue_render();
         }
     }
+    apply_theme_font(state, &theme);
 }
 
 /// Step through `available_themes` by `delta` (+1 next, -1 previous), wrapping
@@ -2451,6 +3370,10 @@ fn save_config(state: &Rc<WindowState>) {
         cursor_blink: Some(state.cursor_blink.get()),
         click_word_select: Some(state.click_word_select.get()),
         copy_on_select: Some(state.copy_on_select.get()),
+        tab_max_number: Some(state.tab_max.get()),
+        confirm_tab_close: Some(state.confirm_tab_close.get()),
+        confirm_pane_close: Some(state.confirm_pane_close.get()),
+        confirm_window_close: Some(state.confirm_window_close.get()),
     };
     if let Err(e) = cfg.save(&path) {
         log::warn!("save config: {e}");
@@ -2609,24 +3532,28 @@ fn open_settings(state: &Rc<WindowState>) {
     };
 
     let mut selected_row: Option<ListBoxRow> = None;
-    let mut first_light = true;
 
-    // Dark section header
-    add_header(&theme_list, "Dark");
-
+    // Partition the themes list into three buckets — built-in dark, built-in
+    // light, user-loaded "Custom" — while keeping each row's index into the
+    // original `themes` vec (so the selection handler can still look up the
+    // theme by `widget_name`).
+    let mut dark_idxs: Vec<usize> = Vec::new();
+    let mut light_idxs: Vec<usize> = Vec::new();
+    let mut custom_idxs: Vec<usize> = Vec::new();
     for (idx, t) in themes.iter().enumerate() {
-        if !t.is_dark() {
-            // Insert separator + Light header before the first light theme
-            if first_light {
-                first_light = false;
-                let sep_row = ListBoxRow::new();
-                sep_row.set_selectable(false);
-                sep_row.set_activatable(false);
-                sep_row.set_child(Some(&Separator::new(Orientation::Horizontal)));
-                theme_list.append(&sep_row);
-                add_header(&theme_list, "Light");
-            }
+        if state.user_theme_names.contains(&t.name) {
+            custom_idxs.push(idx);
+        } else if t.is_dark() {
+            dark_idxs.push(idx);
+        } else {
+            light_idxs.push(idx);
         }
+    }
+
+    let add_theme_row = |theme_list: &ListBox,
+                         idx: usize,
+                         t: &Theme,
+                         selected_row: &mut Option<ListBoxRow>| {
         let row = ListBoxRow::new();
         row.set_widget_name(&idx.to_string());
         let lbl = Label::builder().label(t.name.as_str()).xalign(0.0).build();
@@ -2635,9 +3562,35 @@ fn open_settings(state: &Rc<WindowState>) {
         lbl.set_margin_bottom(4);
         row.set_child(Some(&lbl));
         if t.name == current_theme_name {
-            selected_row = Some(row.clone());
+            *selected_row = Some(row.clone());
         }
         theme_list.append(&row);
+    };
+    let add_separator = |theme_list: &ListBox| {
+        let sep_row = ListBoxRow::new();
+        sep_row.set_selectable(false);
+        sep_row.set_activatable(false);
+        sep_row.set_child(Some(&Separator::new(Orientation::Horizontal)));
+        theme_list.append(&sep_row);
+    };
+
+    let mut need_sep = false;
+    for (label, idxs) in [
+        ("Dark", &dark_idxs),
+        ("Light", &light_idxs),
+        ("Custom", &custom_idxs),
+    ] {
+        if idxs.is_empty() {
+            continue;
+        }
+        if need_sep {
+            add_separator(&theme_list);
+        }
+        add_header(&theme_list, label);
+        for &idx in idxs {
+            add_theme_row(&theme_list, idx, &themes[idx], &mut selected_row);
+        }
+        need_sep = true;
     }
 
     if let Some(r) = selected_row {
@@ -2773,6 +3726,68 @@ fn open_settings(state: &Rc<WindowState>) {
     }
     behavior.attach(&copy_switch, 1, 4, 1, 1);
 
+    // Max tabs spin button.
+    behavior.attach(&row_label("Max tabs"), 0, 5, 1, 1);
+    let tab_max_spin = SpinButton::with_range(1.0, 100.0, 1.0);
+    tab_max_spin.set_value(state.tab_max.get() as f64);
+    tab_max_spin.set_halign(Align::Start);
+    tab_max_spin.set_tooltip_text(Some("Maximum number of tabs allowed in one window."));
+    {
+        let state = state.clone();
+        tab_max_spin.connect_value_changed(move |s| {
+            state.tab_max.set(s.value() as u32);
+            save_config(&state);
+        });
+    }
+    behavior.attach(&tab_max_spin, 1, 5, 1, 1);
+
+    // Confirm tab close toggle.
+    behavior.attach(&row_label("Confirm tab close"), 0, 6, 1, 1);
+    let confirm_tab_switch = gtk4::Switch::new();
+    confirm_tab_switch.set_active(state.confirm_tab_close.get());
+    confirm_tab_switch.set_halign(Align::Start);
+    confirm_tab_switch.set_tooltip_text(Some("Ask for confirmation before closing a tab."));
+    {
+        let state = state.clone();
+        confirm_tab_switch.connect_active_notify(move |sw| {
+            state.confirm_tab_close.set(sw.is_active());
+            save_config(&state);
+        });
+    }
+    behavior.attach(&confirm_tab_switch, 1, 6, 1, 1);
+
+    // Confirm pane close toggle.
+    behavior.attach(&row_label("Confirm pane close"), 0, 7, 1, 1);
+    let confirm_pane_switch = gtk4::Switch::new();
+    confirm_pane_switch.set_active(state.confirm_pane_close.get());
+    confirm_pane_switch.set_halign(Align::Start);
+    confirm_pane_switch.set_tooltip_text(Some("Ask for confirmation before closing a pane."));
+    {
+        let state = state.clone();
+        confirm_pane_switch.connect_active_notify(move |sw| {
+            state.confirm_pane_close.set(sw.is_active());
+            save_config(&state);
+        });
+    }
+    behavior.attach(&confirm_pane_switch, 1, 7, 1, 1);
+
+    // Confirm window close toggle.
+    behavior.attach(&row_label("Confirm window close"), 0, 8, 1, 1);
+    let confirm_win_switch = gtk4::Switch::new();
+    confirm_win_switch.set_active(state.confirm_window_close.get());
+    confirm_win_switch.set_halign(Align::Start);
+    confirm_win_switch.set_tooltip_text(Some(
+        "Ask for confirmation before closing the terminal window.",
+    ));
+    {
+        let state = state.clone();
+        confirm_win_switch.connect_active_notify(move |sw| {
+            state.confirm_window_close.set(sw.is_active());
+            save_config(&state);
+        });
+    }
+    behavior.attach(&confirm_win_switch, 1, 8, 1, 1);
+
     notebook.append_page(&behavior, Some(&Label::new(Some("Behavior"))));
 
     // ── Keybindings ──────────────────────────────────────────────────
@@ -2824,20 +3839,37 @@ fn open_settings(state: &Rc<WindowState>) {
 
 fn keybinding_reference() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("Ctrl+A → →", "Split pane to the right"),
-        ("Ctrl+A → ↑", "Split pane above"),
-        ("Ctrl+A → t", "Open a new tab"),
-        ("Ctrl+A → o", "Cycle focus to the next pane"),
-        ("Ctrl+A → h/j/k/l", "Focus pane left / down / up / right"),
-        ("Ctrl+A → Ctrl+A", "Send literal Ctrl+A to the shell"),
+        // Splits, tabs, close — the menu accelerators registered via
+        // `install_accelerators`. Listed first since these are the chords
+        // users picking up from Terminator will reach for.
+        ("Ctrl + Shift + O", "Split horizontally (new pane below)"),
+        ("Ctrl + Shift + E", "Split vertically (new pane to the right)"),
+        ("Ctrl + Shift + T", "Open a new tab"),
+        ("Ctrl + A + T", "Open a new tab (alternate shortcut)"),
+        ("Ctrl + A + N", "Open a new window"),
+        ("Ctrl + Shift + W", "Close the focused pane"),
+        // Chord (tmux-style prefix) — alternate keybindings for the same
+        // operations plus extras (focus movement, literal Ctrl+A pass-through).
+        ("Ctrl + A + ←/↑/↓/→", "Split in that direction"),
+        ("Ctrl + A + O", "Cycle focus to the next pane"),
+        ("Ctrl + A + h/j/k/l", "Focus pane left / down / up / right"),
+        ("Ctrl + A + ' / /", "Previous / next theme (focused pane)"),
+        ("Ctrl + A + Ctrl+A", "Send literal Ctrl+A to the shell"),
+        // Clipboard.
+        ("Ctrl + Shift + C", "Copy selection"),
+        ("Ctrl + Shift + V", "Paste from system clipboard"),
+        ("Ctrl + Shift + A", "Select all (focused pane)"),
+        ("Middle-click", "Paste primary selection"),
+        ("Left-drag", "Select text"),
+        ("Double-click / triple-click", "Select word / line"),
+        // Zoom.
         ("Ctrl + + / =", "Zoom in (focused pane)"),
         ("Ctrl + -", "Zoom out (focused pane)"),
         ("Ctrl + 0", "Reset font size (focused pane)"),
         ("Ctrl + Scroll", "Zoom focused pane"),
-        ("Ctrl+Shift+V", "Paste from system clipboard"),
-        ("Middle-click", "Paste primary selection"),
-        ("Left-drag", "Select text"),
+        // Misc.
         ("Right-click", "Open the context menu"),
+        ("Toolbar ⋯ drag", "Rearrange pane (drop on an edge of another pane)"),
     ]
 }
 
