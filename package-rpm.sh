@@ -35,15 +35,17 @@ check_deps() {
 build_release() {
     info "Building release binary..."
 
-    # RUSTFLAGS: target the host CPU for maximum optimization.
-    # Remove -C target-cpu=native if building for distribution on other machines.
-    # RUSTFLAGS="-C target-cpu=native" \
-    #     cargo build \
-    #         --release \
-    #         --package skyterm-gui \
-    #         --locked
-
-    RUSTFLAGS="-C target-cpu=native" \
+    # Build a PORTABLE binary for distribution: do NOT pass
+    # `-C target-cpu=native`. That flag bakes in this build host's CPU
+    # features (AVX-512, etc.); the resulting RPM would SIGILL on any user
+    # with an older CPU. (Use native only for throwaway personal local builds.)
+    #
+    # `-C link-arg=-fuse-ld=bfd` mirrors package-deb.sh: rustc >= 1.90 defaults
+    # to the bundled rust-lld linker, which doesn't search the system lib dirs
+    # the way GNU ld does, so -lgtk-4 / -lepoxy / etc. can fail to resolve.
+    # Forcing the GNU linker keeps the two packaging scripts consistent and
+    # robust across toolchain versions. Honors any pre-set RUSTFLAGS.
+    RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-fuse-ld=bfd" \
         cargo build \
             --release \
             --package skyterm-gui \

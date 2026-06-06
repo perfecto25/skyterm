@@ -38,6 +38,40 @@ const CHORD_TIMEOUT: Duration = Duration::from_secs(2);
 /// terminal grid. `__FONT_FAMILY__` is substituted at runtime with the active
 /// font's family name (see [`build_css`] / [`apply_chrome_font`]) and the
 /// provider is reloaded on font changes.
+/// Dark-menu CSS stamped on popovers with the `.skyterm-menu` class.
+/// Registered at priority 10 000 so it outranks the system theme (priority
+/// 200). NOTE: do NOT add `!important` — in GTK4 marking these declarations
+/// important paradoxically makes them lose to the theme's non-important rules,
+/// so the menu renders light. Plain declarations at high priority win cleanly.
+const CSS_DARK_MENU: &str = "
+popover.skyterm-menu,
+popover.skyterm-menu > contents,
+popover.skyterm-menu box,
+popover.skyterm-menu scrolledwindow,
+popover.skyterm-menu viewport {
+    background-color: #1e1e1e;
+    color:            #e0e0e0;
+}
+popover.skyterm-menu modelbutton {
+    color: #e0e0e0;
+    background-color: transparent;
+}
+popover.skyterm-menu modelbutton:hover,
+popover.skyterm-menu modelbutton:focus {
+    background-color: rgba(255, 255, 255, 0.14);
+    color: #ffffff;
+}
+popover.skyterm-menu label {
+    color: #e0e0e0;
+}
+popover.skyterm-menu modelbutton accelerator {
+    color: rgba(255, 255, 255, 0.55);
+}
+popover.skyterm-menu separator {
+    background-color: rgba(255, 255, 255, 0.10);
+}
+";
+
 const CSS_TEMPLATE: &str = "
 .pane-wrap {
     border: 2px solid transparent;
@@ -52,7 +86,6 @@ popover.menu modelbutton accelerator {
     font-family: __FONT_FAMILY__, monospace;
 }
 popover.menu modelbutton accelerator {
-    color: rgba(255, 255, 255, 0.55);
     padding-left: 24px;
 }
 popover.menu scrollbar,
@@ -155,6 +188,46 @@ enum SplitDir {
     Down,
 }
 
+/// A preset arrangement of panes built by composing single splits. Chosen from
+/// the right-click Layouts submenu (opens a new tab with the layout) and from
+/// the `default_layout` config applied to each new window on startup.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// One pane (the default — no splits).
+    Single,
+    /// Two panes split by a horizontal divider (top / bottom).
+    TwoH,
+    /// Two panes split by a vertical divider (left / right).
+    TwoV,
+    /// Two panes side-by-side on top, one full-width pane below.
+    Three,
+    /// Four panes in an even 2×2 grid.
+    Four,
+}
+
+impl Layout {
+    /// Parse the config / action-parameter id. Unknown ids fall back to `Single`.
+    fn from_id(s: &str) -> Layout {
+        match s {
+            "2h" => Layout::TwoH,
+            "2v" => Layout::TwoV,
+            "3" => Layout::Three,
+            "4" => Layout::Four,
+            _ => Layout::Single,
+        }
+    }
+
+}
+
+/// The layout ids in menu / dropdown display order, paired with their labels.
+const LAYOUT_CHOICES: &[(&str, &str)] = &[
+    ("single", "Single pane"),
+    ("2h", "2 panes H"),
+    ("2v", "2 panes V"),
+    ("3", "3 panes"),
+    ("4", "4 panes"),
+];
+
 struct WindowState {
     /// Every tab in the window. Each tab owns its own pane tree.
     tabs: RefCell<Vec<Rc<Tab>>>,
@@ -214,6 +287,9 @@ struct WindowState {
     confirm_window_close: Cell<bool>,
     /// Whether to show the floating drag/close toolbar on split panes.
     show_pane_toolbar: Cell<bool>,
+    /// Layout id (`single`/`2h`/`2v`/`3`/`4`) applied to each *new* window on
+    /// startup. Changed from Settings; only affects windows opened afterward.
+    default_layout: RefCell<String>,
     /// Set to `true` just before programmatically closing the window so the
     /// `close-request` handler lets it through without showing a second dialog.
     force_close: Cell<bool>,
@@ -347,8 +423,19 @@ pub fn on_activate(app: &Application) {
     // the chord keybindings are still registered separately in
     // `install_pane_actions` but no longer surfaced in the menu.
     let splits = gio::Menu::new();
-    splits.append(Some("Split Horizontally"), Some("pane.split-horizontal"));
-    splits.append(Some("Split Vertically"),   Some("pane.split-vertical"));
+    splits.append(Some("― Split Horizontally"), Some("pane.split-horizontal"));
+    splits.append(Some("| Split Vertically"),  Some("pane.split-vertical"));
+
+    // Layouts submenu — each opens a new tab pre-split into the chosen preset.
+    // "single" is omitted (that's just New Tab).
+    let layouts_submenu = gio::Menu::new();
+    for (id, label) in LAYOUT_CHOICES.iter().filter(|(id, _)| *id != "single") {
+        let item = gio::MenuItem::new(Some(label), None);
+        item.set_action_and_target_value(Some("pane.layout"), Some(&id.to_variant()));
+        layouts_submenu.append_item(&item);
+    }
+    splits.append_submenu(Some("Layouts"), &layouts_submenu);
+
     splits.append(Some("New Tab"),            Some("pane.new-tab"));
     splits.append(Some("New Window"),         Some("pane.new-window"));
 
@@ -460,6 +547,10 @@ pub fn on_activate(app: &Application) {
     let confirm_pane_close = cfg.confirm_pane_close.unwrap_or(true);
     let confirm_window_close = cfg.confirm_window_close.unwrap_or(true);
     let show_pane_toolbar = cfg.show_pane_toolbar.unwrap_or(true);
+    let default_layout = cfg
+        .default_layout
+        .clone()
+        .unwrap_or_else(|| "single".to_string());
 
     let state = Rc::new(WindowState {
         tabs: RefCell::new(Vec::new()),
@@ -485,6 +576,7 @@ pub fn on_activate(app: &Application) {
         confirm_pane_close: Cell::new(confirm_pane_close),
         confirm_window_close: Cell::new(confirm_window_close),
         show_pane_toolbar: Cell::new(show_pane_toolbar),
+        default_layout: RefCell::new(default_layout),
         force_close: Cell::new(false),
         dragging: RefCell::new(None),
         css_provider,
@@ -592,6 +684,20 @@ pub fn on_activate(app: &Application) {
         return;
     }
 
+    // Build the configured startup layout in the first tab (before the
+    // font/scrollback passes below, so the layout's panes inherit them too).
+    let startup_layout = Layout::from_id(&state.default_layout.borrow());
+    if startup_layout != Layout::Single {
+        if let Some(p) = state
+            .tabs
+            .borrow()
+            .first()
+            .and_then(|t| t.panes.borrow().first().cloned())
+        {
+            apply_layout(&state, &p, startup_layout);
+        }
+    }
+
     // Apply persisted font size / scrollback after the first pane exists,
     // since both operate on per-pane state.
     if let Some(size) = cfg.font_size {
@@ -640,6 +746,24 @@ fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
         });
         group.add_action(&action);
     }
+
+    // Layouts: open a new tab and build the chosen preset arrangement in it.
+    let layout_action = gio::SimpleAction::new("layout", Some(glib::VariantTy::STRING));
+    {
+        let state = state.clone();
+        layout_action.connect_activate(move |_, param| {
+            let id = param.and_then(|v| v.get::<String>()).unwrap_or_default();
+            let layout = Layout::from_id(&id);
+            if new_tab(&state) {
+                if let Some(p) = current_tab(&state)
+                    .and_then(|t| t.panes.borrow().first().cloned())
+                {
+                    apply_layout(&state, &p, layout);
+                }
+            }
+        });
+    }
+    group.add_action(&layout_action);
 
     let close = gio::SimpleAction::new("close", None);
     {
@@ -769,6 +893,7 @@ fn install_accelerators(app: &Application) {
         ("pane.split-horizontal", &["<Primary><Shift>o"]),
         ("pane.split-vertical",   &["<Primary><Shift>e"]),
         ("pane.new-tab",          &["<Primary><Shift>t"]),
+        ("pane.new-window",       &["<Primary><Shift>n"]),
         // Clipboard. The same chords are also handled directly in
         // `wire_pane`'s key controller; the app-level binding takes
         // precedence and dispatches through `action_target` instead, which
@@ -957,7 +1082,7 @@ fn make_tab(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Tab>> {
     // Toggling visibility (never add/remove) avoids the re-entrant GTK signals
     // that fire during gtk_box_remove and cause Gtk-CRITICAL parent-lookup failures.
     let title_entry = Entry::new();
-    title_entry.set_max_width_chars(32);
+    title_entry.set_hexpand(true);
     title_entry.set_visible(false);
 
     let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
@@ -984,12 +1109,14 @@ fn make_tab(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Tab>> {
             let lbl = lbl_w.clone();
             let ent = ent_w.clone();
             let gla = gl_area_w.clone();
+            let tlbl = tab_label.clone();
             move || {
                 if !gtk4::prelude::WidgetExt::is_visible(&ent) { return; }
                 let text = ent.text().trim().to_string();
                 if !text.is_empty() { lbl.set_text(&text); }
                 ent.set_visible(false);
                 lbl.set_visible(true);
+                tlbl.set_size_request(220, -1);
                 if let Some(gl) = gla.upgrade() { gl.grab_focus(); }
             }
         });
@@ -1006,11 +1133,13 @@ fn make_tab(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Tab>> {
             let lbl = lbl_w.clone();
             let ent = ent_w.clone();
             let gla = gl_area_w.clone();
+            let tlbl = tab_label.clone();
             move |_, keyval, _, _| {
                 if keyval == gdk::Key::Escape {
                     if gtk4::prelude::WidgetExt::is_visible(&ent) {
                         ent.set_visible(false);
                         lbl.set_visible(true);
+                        tlbl.set_size_request(220, -1);
                         if let Some(gl) = gla.upgrade() { gl.grab_focus(); }
                     }
                     return glib::Propagation::Stop;
@@ -1034,15 +1163,18 @@ fn make_tab(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Tab>> {
         dbl.connect_pressed({
             let lbl = lbl_w;
             let ent = ent_w;
+            let tlbl = tab_label.clone();
             move |gesture, n_press, _, _| {
                 if n_press < 2 {
                     // Let single-clicks through to the notebook's tab-switch.
                     gesture.set_state(gtk4::EventSequenceState::Denied);
                     return;
                 }
+                // Lock the tab to its current width so the entry doesn't squash it.
+                let w = tlbl.width().max(220);
+                tlbl.set_size_request(w, -1);
                 let current = lbl.label().to_string();
                 ent.set_text(&current);
-                ent.set_width_chars((current.len() as i32).max(8));
                 lbl.set_visible(false);
                 ent.set_visible(true);
                 ent.grab_focus();
@@ -1237,6 +1369,16 @@ fn install_css(family: &str) -> CssProvider {
             &display,
             &provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        // Dark menu CSS at USER priority (800) beats every system/Adwaita rule.
+        // The display holds a GObject ref so the provider stays live even
+        // after the local binding is dropped.
+        let menu_provider = CssProvider::new();
+        menu_provider.load_from_string(CSS_DARK_MENU);
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &menu_provider,
+            10_000, // beats STYLE_PROVIDER_PRIORITY_USER (800) and any libadwaita rule
         );
     }
     provider
@@ -2001,6 +2143,7 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
     // popovers within their parent widget's allocation, and small panes
     // would otherwise produce squashed menus with scrollbars.
     let popover = PopoverMenu::from_model(Some(&state.split_menu));
+    popover.add_css_class("skyterm-menu");
     popover.set_parent(&state.window);
     popover.set_has_arrow(false);
     // Enforce a minimum width wide enough for the longest theme name
@@ -2360,11 +2503,11 @@ fn focus_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
 /// Replace the focused pane's wrapper with a `GtkPaned` containing the old
 /// pane + a freshly-spawned new pane, oriented per `dir`. The new pane takes
 /// focus so chord chains continue against it.
-fn split(state: &Rc<WindowState>, focused: &Rc<Pane>, dir: SplitDir) {
+fn split(state: &Rc<WindowState>, focused: &Rc<Pane>, dir: SplitDir) -> Option<Rc<Pane>> {
     let old_wrap = focused.wrap.clone();
     let Some(parent) = old_wrap.parent() else {
         log::warn!("split: focused pane has no parent");
-        return;
+        return None;
     };
 
     // Inherit the focused pane's current grid size as a sensible initial size
@@ -2375,7 +2518,7 @@ fn split(state: &Rc<WindowState>, focused: &Rc<Pane>, dir: SplitDir) {
     };
     let new_pane = match make_pane(state.clone(), cols.max(10), rows.max(3)) {
         Some(p) => p,
-        None => return,
+        None => return None,
     };
 
     let orientation = match dir {
@@ -2424,7 +2567,7 @@ fn split(state: &Rc<WindowState>, focused: &Rc<Pane>, dir: SplitDir) {
         }
     } else {
         log::warn!("split: unexpected parent widget type");
-        return;
+        return None;
     }
 
     match dir {
@@ -2466,6 +2609,36 @@ fn split(state: &Rc<WindowState>, focused: &Rc<Pane>, dir: SplitDir) {
     }
     wire_pane(state, &new_pane);
     focus_pane(state, &new_pane);
+    Some(new_pane)
+}
+
+/// Build a preset [`Layout`] by composing single [`split`]s off `base` (the
+/// sole pane of a fresh tab). Non-destructive: only ever adds panes. Leaves
+/// focus on the top-left (`base`) pane.
+fn apply_layout(state: &Rc<WindowState>, base: &Rc<Pane>, layout: Layout) {
+    match layout {
+        Layout::Single => {}
+        Layout::TwoH => {
+            split(state, base, SplitDir::Down);
+        }
+        Layout::TwoV => {
+            split(state, base, SplitDir::Right);
+        }
+        Layout::Three => {
+            // Full-width pane below, then split the top row into two columns.
+            split(state, base, SplitDir::Down);
+            split(state, base, SplitDir::Right);
+        }
+        Layout::Four => {
+            // Split into top/bottom rows, then split each row into two columns.
+            let bottom = split(state, base, SplitDir::Down);
+            split(state, base, SplitDir::Right);
+            if let Some(bottom) = bottom {
+                split(state, &bottom, SplitDir::Right);
+            }
+        }
+    }
+    focus_pane(state, base);
 }
 
 /// Close a pane, optionally behind the confirmation dialog when
@@ -3409,6 +3582,7 @@ fn save_config(state: &Rc<WindowState>) {
         confirm_pane_close: Some(state.confirm_pane_close.get()),
         confirm_window_close: Some(state.confirm_window_close.get()),
         show_pane_toolbar: Some(state.show_pane_toolbar.get()),
+        default_layout: Some(state.default_layout.borrow().clone()),
     };
     if let Err(e) = cfg.save(&path) {
         log::warn!("save config: {e}");
@@ -3841,6 +4015,34 @@ fn open_settings(state: &Rc<WindowState>) {
     }
     behavior.attach(&pane_toolbar_switch, 1, 9, 1, 1);
 
+    // Default layout — applied to each new window on startup (and via the
+    // Layouts menu, which opens a new tab). Doesn't reshape the current window.
+    behavior.attach(&row_label("Default layout"), 0, 10, 1, 1);
+    let layout_labels: Vec<&str> = LAYOUT_CHOICES.iter().map(|(_, l)| *l).collect();
+    let layout_model = StringList::new(&layout_labels);
+    let layout_dd = DropDown::new(Some(layout_model), gtk4::Expression::NONE);
+    layout_dd.set_hexpand(true);
+    layout_dd.set_tooltip_text(Some(
+        "Pane arrangement built in each new window on startup.",
+    ));
+    {
+        let current = state.default_layout.borrow().clone();
+        if let Some(idx) = LAYOUT_CHOICES.iter().position(|(id, _)| *id == current) {
+            layout_dd.set_selected(idx as u32);
+        }
+    }
+    {
+        let state = state.clone();
+        layout_dd.connect_selected_notify(move |dd| {
+            let idx = dd.selected() as usize;
+            if let Some((id, _)) = LAYOUT_CHOICES.get(idx) {
+                *state.default_layout.borrow_mut() = (*id).to_string();
+                save_config(&state);
+            }
+        });
+    }
+    behavior.attach(&layout_dd, 1, 10, 1, 1);
+
     notebook.append_page(&behavior, Some(&Label::new(Some("Behavior"))));
 
     // ── Keybindings ──────────────────────────────────────────────────
@@ -3898,8 +4100,9 @@ fn keybinding_reference() -> Vec<(&'static str, &'static str)> {
         ("Ctrl + Shift + O", "Split horizontally (new pane below)"),
         ("Ctrl + Shift + E", "Split vertically (new pane to the right)"),
         ("Ctrl + Shift + T", "Open a new tab"),
+        ("Ctrl + Shift + N", "Open a new window"),
         ("Ctrl + A + T", "Open a new tab (alternate shortcut)"),
-        ("Ctrl + A + N", "Open a new window"),
+        ("Ctrl + A + N", "Open a new window (alternate shortcut)"),
         ("Ctrl + Shift + W", "Close the focused pane"),
         // Chord (tmux-style prefix) — alternate keybindings for the same
         // operations plus extras (focus movement, literal Ctrl+A pass-through).

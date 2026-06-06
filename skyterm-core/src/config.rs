@@ -48,6 +48,10 @@ pub struct Config {
     /// Show the floating drag/close toolbar on split panes. `None` / absent means enabled.
     #[serde(default)]
     pub show_pane_toolbar: Option<bool>,
+    /// Pane layout applied to each new window on startup. One of `single`,
+    /// `2h`, `2v`, `3`, `4`. `None` / absent means `single`.
+    #[serde(default)]
+    pub default_layout: Option<String>,
 }
 
 impl Config {

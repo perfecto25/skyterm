@@ -102,7 +102,9 @@ MacOS
 
 by default, each tab will be named Tab + incremented number, to change the name of each tab, double click on Tab header and type in a new name, hit Enter
 
-#### Panes
+#### Panes and Windows
+
+Panes are virtual sub-terminals inside the parent terminal window
 
 Split panes
 
@@ -113,6 +115,11 @@ Linux
     Ctrl+A → Left key  (split pane left)
     Ctrl+A → Up key  (split pane right)
     Ctrl+A → Down key  (split pane down)
+
+    or Terminator-style shortcuts
+
+    Shift + Ctrl + O (split horizontally)
+    Shift + Ctrl + E (split vertically)
 ```
 
 ```
@@ -152,16 +159,23 @@ To move a pane to another tab, drag the pane via Toolbar drag icon and hover ove
 
 Pane toolbars can be disabled in Settings > Behavior or via config file variable 'show_pane_toolbar'
 
+To open a new terminal window, right click Menu > New Window or via shortcut
+
+    Shift + Ctrl + N
 
 #### Copy and paste
 
 Copy 
 
-    Shift + Ctrl + c
+    Shift + Ctrl + C
 
 Paste 
 
-    Shift + Ctrl + v
+    Shift + Ctrl + V
+
+Select All
+
+    Shift + Ctrl + A
 
 
 #### Color Themes
@@ -237,6 +251,67 @@ copy_on_select automatically copies any selection (word, line, or drag) to the c
 for specific theme on a specific pane, right click > Menu > Themes and choose a theme to apply to this specific pane
 
 
+
+### Layouts
+
+Skyterm supports preconfigured pane layouts
+
+Available layouts 
+
+single 
+
+```
++----------------+ 
+|                | 
+|                |
+|                |
+|                |
++----------------+ 
+```
+
+2 panes vertical
+
+```
++------+ +------+
+|      | |      |
+|      | |      |
+|      | |      |
+|      | |      |
++------+ +------+
+```
+
+2 panes horizontal
+
+```
++----------------+
+|                |
+|                |
++----------------+
++----------------+
+|                |
+|                |
++----------------+
+```
+
+3 panes
+
+```
++---------+ +---------+
+|         |  |        |
+|         |  |        |
++---------+ +---------+
++---------------------+
+|                     |
+|                     |
++---------------------+
+```
+
+Pane layout can also be configured in skyterm config TOML (default is single pane)
+
+    default_layout = single / 2v / 2h / 3 / 4
+
+or from the Menu > Settings > Behavior > Default layout
+
 ### Building
 
 
@@ -287,13 +362,10 @@ for MacOS builds
 
 ### Roadmap
 
-~~- add documentation on themes, add ability to integrate custom themes via terminator-style config files~~
-- add ability to view images in terminal
-- add syntax highlighter for bash, python, json, yaml via cat
-- add ability to modify keyboard shortcuts via config file
-~~- add New Window command~~
-~~- change split menu option to single row with 4 sub buttons Up, Down, Left, Right~~
+- ~~add documentation on themes, add ability to integrate custom themes via terminator-style config files~~
+- ~~add New Window command~~
+- ~~change split menu option to single row with 4 sub buttons Up, Down, Left, Right~~
 ~~- add keyboard shortcut helpers to all menu commands (gray shortcut helper text)~~
 - add button few pixels to right of rightmost tab "new tab", should be able to create new tab via button (along w menu and KB shortcut)
-~~- add ability to drag and drop panes in different locations, ie terminator behavior, move panes left, right etc~~
-~~- add ability to drag a pane into a different tab, highlight the drop placement area on the new tab~~
+- ~~add ability to drag and drop panes in different locations, ie terminator behavior, move panes left, right etc~~
+- ~~add ability to drag a pane into a different tab, highlight the drop placement area on the new tab~~

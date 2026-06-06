@@ -152,6 +152,12 @@ ncurses apps (htop, vim, less) call `keypad()`, which sets DECCKM (`?1h`) and th
 
 Mouse reports: SGR (`?1006`) is `CSI < b ; col ; row M` (press/motion) or `m` (release); legacy X10 is `CSI M Cb Cx Cy` with each byte offset by 32 — note the **`[`**: it's `ESC [ M`, not `ESC M` (that's reverse-index RI and was a real bug in the scroll encoder).
 
+### GTK4 CSS `!important` loses — never use it (dark menu)
+
+The right-click menu must render dark or the accelerator hints are invisible on a light system theme. The fix is `CSS_DARK_MENU` (selectors on `popover.skyterm-menu …`), registered via `style_context_add_provider_for_display` at **priority 10 000** (well above the theme's 200). The non-obvious trap that cost three failed attempts: **adding `!important` to those declarations makes them LOSE to the theme's non-important rules**, so the menu stays light. GTK4's `!important` cascade does the opposite of the CSS spec here. Plain declarations at a high provider priority win cleanly — that's the only thing that works. Don't reintroduce `!important`.
+
+Proven empirically: dump the popover's live node tree + `widget.color()` while it's realized (a magenta no-`!important` rule applied; the same rule with `!important` reverted to the theme default). The popover node tree is `popover.background.menu.skyterm-menu › contents › scrolledwindow › viewport › stack › box… › modelbutton{box,label,accelerator}`; the class is added with `popover.add_css_class("skyterm-menu")` right after `PopoverMenu::from_model`.
+
 ## Verification
 
 - **Headless tests in `skyterm-core/tests/`** + inline `#[cfg(test)]` modules in `grid.rs` and `parser.rs`. ~39 tests covering reflow (widen/narrow/scrollback-boundary/alt-screen), mouse modes + SGR toggle, DECCKM, scroll region, IL/DL, SGR, cursor save/restore, alt screen, scrollback, DEC graphics.
