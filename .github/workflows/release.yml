@@ -85,6 +85,15 @@ jobs:
           - { runner: macos-13, arch: x86_64 }   # last Intel runner
           - { runner: macos-14, arch: arm64 }     # Apple Silicon
     runs-on: ${{ matrix.runner }}
+    # Intel (macos-13) free runners are scarce and being retired — they can
+    # queue for a long time or be cancelled. Mark only the Intel leg
+    # non-blocking so a slow/absent Intel runner never fails the release;
+    # Apple Silicon (macos-14) stays required. The release publishes whatever
+    # DMGs are ready, adding the Intel one whenever its runner comes through.
+    continue-on-error: ${{ matrix.arch == 'x86_64' }}
+    # Bounds a job that actually starts (does not include queue time); keeps a
+    # hung build from holding the run for the 6-hour default.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
