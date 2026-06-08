@@ -145,7 +145,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*.deb
-            dist/*.rpm
+            dist/debian/*.deb
+            dist/generate-rpm/*.rpm
             dist/*.dmg
           fail_on_unmatched_files: true
