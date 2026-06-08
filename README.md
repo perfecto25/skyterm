@@ -344,7 +344,7 @@ for MacOS builds
 
 ### Changelog
 
-#### 0.1.5
+#### 0.1.6
 
 - tabs are wider in size and can be dragged left or right
 - maximum number of tabs by default is set to 20 for performance reasons. To change this number, update tab_max_number variable in config.toml
