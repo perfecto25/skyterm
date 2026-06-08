@@ -357,6 +357,14 @@ struct Pane {
     /// row, col, consecutive count). Used to distinguish single/double/triple
     /// clicks on the left button without a separate `GestureClick`.
     click_state: Cell<(u32, usize, usize, u8)>,
+    /// Drag-select auto-scroll timer. Armed while the pointer is held past the
+    /// top/bottom edge during a selection drag (see `start_autoscroll`); the
+    /// repeating source scrolls the view + extends the selection until the
+    /// pointer returns in-bounds or the drag ends.
+    autoscroll_source: RefCell<Option<glib::SourceId>>,
+    /// Latest (dir_up, pointer_x) for the active auto-scroll, read each tick so
+    /// the timer follows the pointer's column without being re-armed on motion.
+    autoscroll_params: Cell<(bool, f64)>,
     _child: RefCell<Box<dyn portable_pty::Child + Send + Sync>>,
 }
 
@@ -1533,6 +1541,8 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
         is_focused: Cell::new(false),
         resize_source: RefCell::new(None),
         click_state: Cell::new((0, 0, 0, 0)),
+        autoscroll_source: RefCell::new(None),
+        autoscroll_params: Cell::new((false, 0.0)),
         _child: RefCell::new(pty_handle.child),
     });
 
@@ -2027,20 +2037,35 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
                     }
                     return;
                 }
-                let mut sel = p.selection.borrow_mut();
-                if sel.is_none() {
-                    // First motion: anchor at the press origin.
-                    if let Some(anchor) = pixel_to_cell(&p, sx, sy) {
-                        *sel = Some(Selection { anchor, active: anchor });
+                {
+                    let mut sel = p.selection.borrow_mut();
+                    if sel.is_none() {
+                        // First motion: anchor at the press origin.
+                        if let Some(anchor) = pixel_to_cell(&p, sx, sy) {
+                            *sel = Some(Selection { anchor, active: anchor });
+                        }
                     }
                 }
-                if let Some(active_cell) = pixel_to_cell(&p, sx + dx, sy + dy) {
-                    if let Some(s) = sel.as_mut() {
-                        s.active = active_cell;
+                // When the pointer is dragged past the top/bottom edge, scroll
+                // the scrollback view in that direction and keep extending the
+                // selection (standard terminal behavior). Only the vertical
+                // position decides the edge; the column still tracks x.
+                let px = sx + dx;
+                let py = sy + dy;
+                let height = p.gl_area.height() as f64;
+                if py < 0.0 {
+                    start_autoscroll(&p, true, px);
+                } else if py > height {
+                    start_autoscroll(&p, false, px);
+                } else {
+                    stop_autoscroll(&p);
+                    if let Some(active_cell) = pixel_to_cell(&p, px, py) {
+                        if let Some(s) = p.selection.borrow_mut().as_mut() {
+                            s.active = active_cell;
+                        }
                     }
+                    p.gl_area.queue_render();
                 }
-                drop(sel);
-                p.gl_area.queue_render();
             });
         }
         {
@@ -2048,6 +2073,7 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
             let pane_w = pane_w.clone();
             drag.connect_end(move |g, seq| {
                 let Some(p) = pane_w.upgrade() else { return };
+                stop_autoscroll(&p);
                 if forwards_mouse(&p, g) {
                     if let Some((x, y)) = g.point(seq) {
                         if let Some((row, col)) = pixel_to_cell(&p, x, y) {
@@ -3277,6 +3303,89 @@ fn pixel_to_cell(pane: &Pane, x: f64, y: f64) -> Option<(usize, usize)> {
         return None;
     }
     Some((row.min(g.rows() - 1), col.min(g.cols() - 1)))
+}
+
+/// Tick interval for drag-select auto-scroll (pointer held past a pane edge).
+const AUTOSCROLL_INTERVAL_MS: u64 = 40;
+/// Lines scrolled per auto-scroll tick.
+const AUTOSCROLL_STEP: f64 = 2.0;
+
+/// While drag-selecting, holding the pointer above the top (or below the
+/// bottom) edge of the pane scrolls the scrollback view in that direction and
+/// keeps extending the selection — standard terminal behavior. Records the
+/// direction + pointer x (read each tick so the column follows the pointer)
+/// and arms a single repeating timer; subsequent calls just update the params.
+/// The timer runs until [`stop_autoscroll`] (pointer back in bounds, or drag
+/// end).
+fn start_autoscroll(pane: &Rc<Pane>, dir_up: bool, x: f64) {
+    pane.autoscroll_params.set((dir_up, x));
+    if pane.autoscroll_source.borrow().is_some() {
+        return;
+    }
+    let pane_w = Rc::downgrade(pane);
+    let id = glib::timeout_add_local(
+        Duration::from_millis(AUTOSCROLL_INTERVAL_MS),
+        move || {
+            let Some(p) = pane_w.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let (dir_up, x) = p.autoscroll_params.get();
+            autoscroll_step(&p, dir_up, x);
+            glib::ControlFlow::Continue
+        },
+    );
+    *pane.autoscroll_source.borrow_mut() = Some(id);
+}
+
+/// Cancel any running drag-select auto-scroll timer. Safe to call when none.
+fn stop_autoscroll(pane: &Pane) {
+    if let Some(id) = pane.autoscroll_source.borrow_mut().take() {
+        id.remove();
+    }
+}
+
+/// One auto-scroll tick: scroll the view by [`AUTOSCROLL_STEP`] lines toward
+/// `dir_up` and re-anchor the selection so the fixed (anchor) end tracks its
+/// text while the dragging (active) end pins to the scrolled-in edge row at the
+/// column under pointer `x`. Setting the adjustment value drives
+/// `scroll_adj.connect_value_changed`, which moves the grid view offset.
+fn autoscroll_step(pane: &Pane, dir_up: bool, x: f64) {
+    if pane.selection.borrow().is_none() {
+        stop_autoscroll(pane);
+        return;
+    }
+    let value = pane.scroll_adj.value();
+    let new_value = if dir_up {
+        (value - AUTOSCROLL_STEP).max(pane.scroll_adj.lower())
+    } else {
+        let max = (pane.scroll_adj.upper() - pane.scroll_adj.page_size()).max(0.0);
+        (value + AUTOSCROLL_STEP).min(max)
+    };
+    // Number of lines actually scrolled (0 once we hit the top/bottom limit).
+    let scrolled = (new_value - value).abs().round() as usize;
+    if scrolled > 0 {
+        pane.scroll_adj.set_value(new_value);
+    }
+    let rows = pane.grid.borrow().rows();
+    if rows == 0 {
+        return;
+    }
+    let edge_row = if dir_up { 0 } else { rows - 1 };
+    let col = pixel_to_cell(pane, x, 0.0).map(|(_, c)| c).unwrap_or(0);
+    if let Some(s) = pane.selection.borrow_mut().as_mut() {
+        // The view moved under the anchor by `scrolled` rows; shift the anchor
+        // the same way so it stays glued to its original text. Up-scroll pushes
+        // earlier text down (+); down-scroll pulls it up (−).
+        if scrolled > 0 {
+            if dir_up {
+                s.anchor.0 += scrolled;
+            } else {
+                s.anchor.0 = s.anchor.0.saturating_sub(scrolled);
+            }
+        }
+        s.active = (edge_row, col);
+    }
+    pane.gl_area.queue_render();
 }
 
 /// Standard terminal behavior: when the user is viewing scrollback and

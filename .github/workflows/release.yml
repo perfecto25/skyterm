@@ -82,7 +82,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-13, arch: x86_64 }   # last Intel runner
+         # - { runner: macos-13, arch: x86_64 }   # last Intel runner
           - { runner: macos-14, arch: arm64 }     # Apple Silicon
     runs-on: ${{ matrix.runner }}
     # Intel (macos-13) free runners are scarce and being retired — they can
