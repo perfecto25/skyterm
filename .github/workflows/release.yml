@@ -13,6 +13,11 @@ name: release
 # git tag -a v0.1.7 -m 'release 0.1.7'
 # git push origin --tags
 
+## re-run release
+## git tag -d v0.1.7
+## git tag v0.1.7
+## git push --force origin v0.1.7
+
 # Run manually (workflow_dispatch) to build + upload artifacts without
 # creating a release — useful for testing the pipeline before cutting a tag.
 #
