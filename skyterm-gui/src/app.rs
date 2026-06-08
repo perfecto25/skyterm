@@ -64,6 +64,15 @@ popover.skyterm-menu modelbutton:focus {
 popover.skyterm-menu label {
     color: #e0e0e0;
 }
+/* Item text tinted by what it acts on: New Tab green, New Window pink.
+   Classes are stamped onto the realized labels by `colorize_menu_items`
+   since a GMenu model can't carry CSS. */
+popover.skyterm-menu label.menu-tab {
+    color: #2ecc71;
+}
+popover.skyterm-menu label.menu-window {
+    color: #ff79c6;
+}
 popover.skyterm-menu modelbutton accelerator {
     color: rgba(255, 255, 255, 0.55);
 }
@@ -100,7 +109,7 @@ popover.menu undershoot {
     padding: 0;
 }
 button.pane-close-btn {
-    color: #c0392b;
+    color: #f1c40f;
     background: none;
     border: none;
     box-shadow: none;
@@ -108,7 +117,7 @@ button.pane-close-btn {
     margin: 0;
 }
 button.pane-close-btn:hover {
-    background: rgba(192, 57, 43, 0.18);
+    background: rgba(231, 76, 60, 0.25);
 }
 .pane-toolbar {
     background: rgba(40, 40, 40, 0.85);
@@ -2182,6 +2191,7 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
     // widgets are created lazily so we can't catch them at construction.
     popover.connect_show(|p| {
         unconstrain_scrolled_windows(p.upcast_ref::<gtk4::Widget>());
+        colorize_menu_items(p.upcast_ref::<gtk4::Widget>());
     });
     // `visible-submenu` fires synchronously on GTK4 4.8+; belt-and-suspenders
     // for versions where it works.
@@ -3225,6 +3235,35 @@ fn unconstrain_scrolled_windows(widget: &gtk4::Widget) {
     let mut child = widget.first_child();
     while let Some(c) = child {
         unconstrain_scrolled_windows(&c);
+        child = c.next_sibling();
+    }
+}
+
+/// Walk the popover's realized widget tree and tint specific menu-item labels
+/// by what they act on: New Tab green, New Window pink. A GMenu model can't
+/// carry per-item CSS, so we match the realized `GtkLabel`s by their text and
+/// stamp a color class (see the `menu-tab` / `menu-window` rules in
+/// `CSS_DARK_MENU`). The accelerator labels carry different text and are left
+/// untouched. Idempotent — re-run safely on every `show`.
+fn colorize_menu_items(widget: &gtk4::Widget) {
+    if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
+        let text = label.text();
+        let class = if text.contains("New Tab") {
+            Some("menu-tab")
+        } else if text.contains("New Window") {
+            Some("menu-window")
+        } else {
+            None
+        };
+        if let Some(class) = class {
+            if !label.has_css_class(class) {
+                label.add_css_class(class);
+            }
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        colorize_menu_items(&c);
         child = c.next_sibling();
     }
 }
