@@ -9,6 +9,10 @@ name: release
 #   * macOS Apple   → .dmg          (macos-14)
 #
 # Push a `vX.Y.Z` tag to build + publish a GitHub Release with all artifacts.
+
+# git tag -a v0.1.7 -m 'release 0.1.7'
+# git push origin --tags
+
 # Run manually (workflow_dispatch) to build + upload artifacts without
 # creating a release — useful for testing the pipeline before cutting a tag.
 #
