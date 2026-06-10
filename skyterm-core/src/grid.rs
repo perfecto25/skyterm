@@ -381,11 +381,23 @@ impl Grid {
         }
     }
 
-    /// Cell at view-relative position (0 = topmost visible row).
-    /// When scrolled up, the top of the view shows old scrollback lines.
-    pub fn visible_cell(&self, view_row: usize, col: usize) -> Cell {
+    /// Total addressable logical rows: scrollback history plus the live screen.
+    /// Logical row 0 is the oldest scrollback line; the last `rows` indices are
+    /// the current screen, top→bottom. Unlike view rows, logical rows are stable
+    /// under scrolling, so a selection that spans more than one screenful stores
+    /// logical coordinates and survives auto-scroll.
+    pub fn logical_rows(&self) -> usize {
+        self.scrollback.len() + self.rows
+    }
+
+    /// Convert a view-relative row (0 = topmost visible) to its logical row.
+    pub fn view_to_logical(&self, view_row: usize) -> usize {
+        self.scrollback.len().saturating_sub(self.view_offset) + view_row
+    }
+
+    /// Cell at an absolute logical row (see [`logical_rows`](Self::logical_rows)).
+    pub fn logical_cell(&self, logical: usize, col: usize) -> Cell {
         let sb_len = self.scrollback.len();
-        let logical = sb_len.saturating_sub(self.view_offset) + view_row;
         if logical < sb_len {
             self.scrollback[logical]
                 .get(col)
@@ -401,18 +413,29 @@ impl Grid {
         }
     }
 
-    /// Whether the view row at `view_row` ends in a soft (auto) wrap — i.e. its
-    /// text continues on the next row. Used to select / copy a whole logical
-    /// line across its wrapped continuation rows.
-    pub fn visible_row_wrapped(&self, view_row: usize) -> bool {
+    /// Whether an absolute logical row ends in a soft (auto) wrap — i.e. its
+    /// text continues on the next row.
+    pub fn logical_row_wrapped(&self, logical: usize) -> bool {
         let sb_len = self.scrollback.len();
-        let logical = sb_len.saturating_sub(self.view_offset) + view_row;
         if logical < sb_len {
             self.scrollback[logical].wrapped
         } else {
             let r = logical - sb_len;
             r < self.rows && self.cells[r].wrapped
         }
+    }
+
+    /// Cell at view-relative position (0 = topmost visible row).
+    /// When scrolled up, the top of the view shows old scrollback lines.
+    pub fn visible_cell(&self, view_row: usize, col: usize) -> Cell {
+        self.logical_cell(self.view_to_logical(view_row), col)
+    }
+
+    /// Whether the view row at `view_row` ends in a soft (auto) wrap — i.e. its
+    /// text continues on the next row. Used to select / copy a whole logical
+    /// line across its wrapped continuation rows.
+    pub fn visible_row_wrapped(&self, view_row: usize) -> bool {
+        self.logical_row_wrapped(self.view_to_logical(view_row))
     }
 
     /// View-relative cursor position. None if cursor is scrolled out of view.

@@ -2049,8 +2049,9 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
                 {
                     let mut sel = p.selection.borrow_mut();
                     if sel.is_none() {
-                        // First motion: anchor at the press origin.
-                        if let Some(anchor) = pixel_to_cell(&p, sx, sy) {
+                        // First motion: anchor at the press origin (logical
+                        // coords so the selection survives scrolling).
+                        if let Some(anchor) = pixel_to_logical_cell(&p, sx, sy) {
                             *sel = Some(Selection { anchor, active: anchor });
                         }
                     }
@@ -2068,7 +2069,7 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
                     start_autoscroll(&p, false, px);
                 } else {
                     stop_autoscroll(&p);
-                    if let Some(active_cell) = pixel_to_cell(&p, px, py) {
+                    if let Some(active_cell) = pixel_to_logical_cell(&p, px, py) {
                         if let Some(s) = p.selection.borrow_mut().as_mut() {
                             s.active = active_cell;
                         }
@@ -3075,13 +3076,16 @@ fn select_word(pane: &Pane, row: usize, col: usize) {
         return;
     }
     let g = pane.grid.borrow();
-    let (start, end) = if is_word_char(g.visible_cell(row, col).ch) {
+    // Work in logical (absolute) coordinates so the selection is consistent
+    // with drag-selections and survives scrolling.
+    let lrow = g.view_to_logical(row);
+    let (start, end) = if is_word_char(g.logical_cell(lrow, col).ch) {
         let mut s = col;
-        while s > 0 && is_word_char(g.visible_cell(row, s - 1).ch) {
+        while s > 0 && is_word_char(g.logical_cell(lrow, s - 1).ch) {
             s -= 1;
         }
         let mut e = col;
-        while e + 1 < cols && is_word_char(g.visible_cell(row, e + 1).ch) {
+        while e + 1 < cols && is_word_char(g.logical_cell(lrow, e + 1).ch) {
             e += 1;
         }
         (s, e)
@@ -3090,8 +3094,8 @@ fn select_word(pane: &Pane, row: usize, col: usize) {
     };
     drop(g);
     *pane.selection.borrow_mut() = Some(Selection {
-        anchor: (row, start),
-        active: (row, end),
+        anchor: (lrow, start),
+        active: (lrow, end),
     });
     pane.gl_area.queue_render();
 }
@@ -3107,16 +3111,19 @@ fn select_line(pane: &Pane, row: usize) {
         return;
     }
     let g = pane.grid.borrow();
-    let mut start = row;
-    while start > 0 && g.visible_row_wrapped(start - 1) {
+    // Logical (absolute) coordinates; expand across soft-wrapped rows in both
+    // directions over the whole buffer, not just the visible screen.
+    let logical_rows = g.logical_rows();
+    let mut start = g.view_to_logical(row);
+    while start > 0 && g.logical_row_wrapped(start - 1) {
         start -= 1;
     }
-    let mut end = row;
-    while end + 1 < rows && g.visible_row_wrapped(end) {
+    let mut end = g.view_to_logical(row);
+    while end + 1 < logical_rows && g.logical_row_wrapped(end) {
         end += 1;
     }
     let mut last_col = cols - 1;
-    while last_col > 0 && g.visible_cell(end, last_col).ch == ' ' {
+    while last_col > 0 && g.logical_cell(end, last_col).ch == ' ' {
         last_col -= 1;
     }
     drop(g);
@@ -3127,18 +3134,20 @@ fn select_line(pane: &Pane, row: usize) {
     pane.gl_area.queue_render();
 }
 
-/// Select the entire visible grid. After this, Copy grabs the whole pane.
+/// Select the entire buffer — scrollback history plus the live screen — in
+/// logical coordinates. After this, Copy grabs everything, not just what's
+/// currently on screen.
 fn select_all_pane(pane: &Pane) {
-    let (rows, cols) = {
+    let (logical_rows, cols) = {
         let g = pane.grid.borrow();
-        (g.rows(), g.cols())
+        (g.logical_rows(), g.cols())
     };
-    if rows == 0 || cols == 0 {
+    if logical_rows == 0 || cols == 0 {
         return;
     }
     *pane.selection.borrow_mut() = Some(Selection {
         anchor: (0, 0),
-        active: (rows - 1, cols - 1),
+        active: (logical_rows - 1, cols - 1),
     });
     pane.gl_area.queue_render();
 }
@@ -3150,14 +3159,17 @@ fn copy_selection(pane: &Pane) {
         let Some(sel) = *pane.selection.borrow() else {
             return;
         };
+        // Selection endpoints are logical (absolute) rows, so the copy spans
+        // the whole selected range across scrollback — not just the screenful
+        // currently visible.
         let ((sr, sc), (er, ec)) = sel.ordered();
         let g = pane.grid.borrow();
         let cols = g.cols();
-        let rows = g.rows();
-        if rows == 0 || cols == 0 {
+        let logical_rows = g.logical_rows();
+        if logical_rows == 0 || cols == 0 {
             return;
         }
-        let er = er.min(rows.saturating_sub(1));
+        let er = er.min(logical_rows.saturating_sub(1));
         let ec = ec.min(cols.saturating_sub(1));
         let sr = sr.min(er);
         let sc = if sr == er { sc.min(ec) } else { sc.min(cols - 1) };
@@ -3168,12 +3180,12 @@ fn copy_selection(pane: &Pane) {
             let to = if r == er { ec } else { cols - 1 };
             let mut line = String::with_capacity(to - from + 1);
             for c in from..=to {
-                line.push(g.visible_cell(r, c).ch);
+                line.push(g.logical_cell(r, c).ch);
             }
             // A soft-wrapped row's text continues on the next row, so join it
             // without a newline (and without trimming — it's full width). Only
             // hard line breaks become `\n`. Matches VTE copy behavior.
-            let soft_wrap = r < er && to == cols - 1 && g.visible_row_wrapped(r);
+            let soft_wrap = r < er && to == cols - 1 && g.logical_row_wrapped(r);
             if soft_wrap {
                 out.push_str(&line);
             } else {
@@ -3344,6 +3356,16 @@ fn pixel_to_cell(pane: &Pane, x: f64, y: f64) -> Option<(usize, usize)> {
     Some((row.min(g.rows() - 1), col.min(g.cols() - 1)))
 }
 
+/// Like [`pixel_to_cell`] but maps the visible row to its *logical* (absolute,
+/// scrollback-aware) row. Selection endpoints use logical coordinates so a
+/// drag- or auto-scroll selection spanning multiple screenfuls survives
+/// scrolling and copies in full.
+fn pixel_to_logical_cell(pane: &Pane, x: f64, y: f64) -> Option<(usize, usize)> {
+    let (row, col) = pixel_to_cell(pane, x, y)?;
+    let logical = pane.grid.borrow().view_to_logical(row);
+    Some((logical, col))
+}
+
 /// Tick interval for drag-select auto-scroll (pointer held past a pane edge).
 const AUTOSCROLL_INTERVAL_MS: u64 = 40;
 /// Lines scrolled per auto-scroll tick.
@@ -3384,10 +3406,11 @@ fn stop_autoscroll(pane: &Pane) {
 }
 
 /// One auto-scroll tick: scroll the view by [`AUTOSCROLL_STEP`] lines toward
-/// `dir_up` and re-anchor the selection so the fixed (anchor) end tracks its
-/// text while the dragging (active) end pins to the scrolled-in edge row at the
-/// column under pointer `x`. Setting the adjustment value drives
-/// `scroll_adj.connect_value_changed`, which moves the grid view offset.
+/// `dir_up`, then pin the dragging (active) end of the selection to the
+/// scrolled-in edge row at the column under pointer `x`. Because the selection
+/// is stored in logical (absolute) coordinates, the anchor needs no adjustment
+/// — it stays glued to its text as the view moves. Setting the adjustment value
+/// drives `scroll_adj.connect_value_changed`, which moves the grid view offset.
 fn autoscroll_step(pane: &Pane, dir_up: bool, x: f64) {
     if pane.selection.borrow().is_none() {
         stop_autoscroll(pane);
@@ -3400,9 +3423,7 @@ fn autoscroll_step(pane: &Pane, dir_up: bool, x: f64) {
         let max = (pane.scroll_adj.upper() - pane.scroll_adj.page_size()).max(0.0);
         (value + AUTOSCROLL_STEP).min(max)
     };
-    // Number of lines actually scrolled (0 once we hit the top/bottom limit).
-    let scrolled = (new_value - value).abs().round() as usize;
-    if scrolled > 0 {
+    if (new_value - value).abs() >= 1.0 {
         pane.scroll_adj.set_value(new_value);
     }
     let rows = pane.grid.borrow().rows();
@@ -3410,19 +3431,12 @@ fn autoscroll_step(pane: &Pane, dir_up: bool, x: f64) {
         return;
     }
     let edge_row = if dir_up { 0 } else { rows - 1 };
+    // Column under the pointer (any in-bounds y works); row is the edge we're
+    // scrolling toward, in logical coordinates.
     let col = pixel_to_cell(pane, x, 0.0).map(|(_, c)| c).unwrap_or(0);
+    let edge_logical = pane.grid.borrow().view_to_logical(edge_row);
     if let Some(s) = pane.selection.borrow_mut().as_mut() {
-        // The view moved under the anchor by `scrolled` rows; shift the anchor
-        // the same way so it stays glued to its original text. Up-scroll pushes
-        // earlier text down (+); down-scroll pulls it up (−).
-        if scrolled > 0 {
-            if dir_up {
-                s.anchor.0 += scrolled;
-            } else {
-                s.anchor.0 = s.anchor.0.saturating_sub(scrolled);
-            }
-        }
-        s.active = (edge_row, col);
+        s.active = (edge_logical, col);
     }
     pane.gl_area.queue_render();
 }

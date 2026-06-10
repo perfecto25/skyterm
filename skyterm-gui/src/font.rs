@@ -30,6 +30,11 @@ pub struct Atlas {
 
 const GLYPHS_PER_ROW: u32 = 32;
 
+/// Unicode Braille Patterns block. Synthesized procedurally (see
+/// [`draw_braille_glyph`]) because monospace fonts rarely cover it, yet
+/// iotop/btop-style graphs lean on it heavily.
+const BRAILLE_RANGE: RangeInclusive<u32> = 0x2800..=0x28FF;
+
 /// Codepoint ranges commonly used by terminal apps. ASCII first so '?' is
 /// guaranteed in early slots.
 pub fn default_ranges() -> Vec<RangeInclusive<u32>> {
@@ -150,6 +155,16 @@ pub fn build_atlas_with_ranges(
     if !codepoints.contains(&('?' as u32)) {
         codepoints.push('?' as u32);
     }
+    // Braille patterns (U+2800–U+28FF) are synthesized procedurally below
+    // (`draw_braille_glyph`) rather than rasterized from the face. They're the
+    // dot-matrix bars iotop/btop use for their GRAPH column, and JetBrains Mono
+    // — like most monospace fonts — ships no braille glyphs, so without this
+    // they fall back to '?' and the graph reads as a wall of question marks.
+    // Drawing them ourselves makes them render at any font/zoom regardless of
+    // coverage. Appended unconditionally; they need no slot in the face.
+    for cp in BRAILLE_RANGE {
+        codepoints.push(cp);
+    }
 
     let total = codepoints.len() as u32;
     let cols = GLYPHS_PER_ROW;
@@ -168,6 +183,13 @@ pub fn build_atlas_with_ranges(
             fallback_slot = slot;
         }
         locations.insert(cp, slot);
+        let slot_x = slot % cols;
+        let slot_y = slot / cols;
+        // Braille is drawn procedurally — skip the FreeType path entirely.
+        if BRAILLE_RANGE.contains(&cp) {
+            draw_braille_glyph(cp, &mut pixels, width, cell_w, cell_h, slot_x, slot_y);
+            continue;
+        }
         // TARGET_LCD: FreeType renders R/G/B sub-pixel coverage. The resulting
         // bitmap.width() is 3× the pixel column count.
         if face
@@ -186,8 +208,6 @@ pub fn build_atlas_with_ranges(
         let bm_left = glyph.bitmap_left();
         let bm_top = glyph.bitmap_top();
 
-        let slot_x = slot % cols;
-        let slot_y = slot / cols;
         let cell_left = (slot_x * cell_w) as i32;
         let cell_top = (slot_y * cell_h) as i32;
         let cell_right = cell_left + cell_w as i32;
@@ -224,4 +244,116 @@ pub fn build_atlas_with_ranges(
         locations,
         fallback_slot,
     })
+}
+
+/// Render one Braille Patterns codepoint into its atlas slot by drawing the
+/// active dots of the 2×4 grid directly. Writes equal coverage to all three
+/// RGB channels (the renderer multiplies these by the cell's fg colour, so a
+/// grey value behaves like ordinary antialiased glyph coverage).
+fn draw_braille_glyph(
+    cp: u32,
+    pixels: &mut [u8],
+    atlas_width: u32,
+    cell_w: u32,
+    cell_h: u32,
+    slot_x: u32,
+    slot_y: u32,
+) {
+    let pattern = (cp - 0x2800) as u8;
+    // Dot bit for [column][row], Unicode braille numbering: left column holds
+    // dots 1,2,3,7 and the right column holds 4,5,6,8 (top→bottom).
+    const BITS: [[u8; 4]; 2] = [
+        [0x01, 0x02, 0x04, 0x40], // left column
+        [0x08, 0x10, 0x20, 0x80], // right column
+    ];
+
+    let cw = cell_w as f32;
+    let ch = cell_h as f32;
+    // Dot centres, inset from the cell edges so adjacent cells' dots stay
+    // visually separated. Two columns, four rows.
+    let col_x = [cw * 0.30, cw * 0.70];
+    let row_y = [ch * 0.16, ch * 0.385, ch * 0.615, ch * 0.84];
+    // Radius a little under half the tighter of the two dot spacings, so dots
+    // read as distinct without leaving the cell.
+    let col_spacing = cw * 0.40;
+    let row_spacing = ch * 0.23;
+    let radius = col_spacing.min(row_spacing) * 0.46;
+    let aa = 0.6_f32; // antialiasing falloff width in pixels
+
+    let base_x = slot_x * cell_w;
+    let base_y = slot_y * cell_h;
+
+    for py in 0..cell_h {
+        let fy = py as f32 + 0.5;
+        for px in 0..cell_w {
+            let fx = px as f32 + 0.5;
+            // Coverage is the max over every active dot of that dot's disc.
+            let mut cov = 0.0_f32;
+            for (col, &cx) in col_x.iter().enumerate() {
+                for (row, &cy) in row_y.iter().enumerate() {
+                    if pattern & BITS[col][row] == 0 {
+                        continue;
+                    }
+                    let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
+                    let c = ((radius + aa - d) / (2.0 * aa)).clamp(0.0, 1.0);
+                    if c > cov {
+                        cov = c;
+                    }
+                }
+            }
+            if cov <= 0.0 {
+                continue;
+            }
+            let v = (cov * 255.0).round() as u8;
+            let dst = (((base_y + py) as usize) * (atlas_width as usize)
+                + (base_x + px) as usize)
+                * 3;
+            pixels[dst] = v;
+            pixels[dst + 1] = v;
+            pixels[dst + 2] = v;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sum of all R-channel coverage in a glyph's cell. Each braille slot is
+    /// laid out at `slot_x = i % cols`, `slot_y = i / cols` like every other.
+    fn slot_ink(atlas: &Atlas, cp: u32) -> u64 {
+        let slot = atlas.locations[&cp];
+        let cols = atlas.glyphs_per_row;
+        let base_x = (slot % cols) * atlas.cell_w;
+        let base_y = (slot / cols) * atlas.cell_h;
+        let mut sum = 0u64;
+        for py in 0..atlas.cell_h {
+            for px in 0..atlas.cell_w {
+                let i = (((base_y + py) as usize) * (atlas.width as usize)
+                    + (base_x + px) as usize)
+                    * 3;
+                sum += atlas.pixels[i] as u64;
+            }
+        }
+        sum
+    }
+
+    #[test]
+    fn braille_is_synthesized_even_without_font_coverage() {
+        let path = PathBuf::from(EMBEDDED_FONT_PATH);
+        let atlas = build_atlas(&path, 18).expect("atlas");
+
+        // Every braille codepoint gets a slot, regardless of font coverage.
+        for cp in BRAILLE_RANGE {
+            assert!(atlas.locations.contains_key(&cp), "missing slot for {cp:#x}");
+        }
+        // U+2800 is the empty pattern — no dots, so no ink.
+        assert_eq!(slot_ink(&atlas, 0x2800), 0);
+        // U+28FF lights all eight dots; U+2801 lights exactly one. Both must
+        // produce ink, and the full pattern must out-ink the single dot.
+        let one = slot_ink(&atlas, 0x2801);
+        let all = slot_ink(&atlas, 0x28FF);
+        assert!(one > 0, "single-dot braille produced no ink");
+        assert!(all > one * 4, "all-dots braille should far exceed one dot");
+    }
 }

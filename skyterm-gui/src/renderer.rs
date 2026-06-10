@@ -256,8 +256,12 @@ impl Renderer {
         // cell's own bg and the default bg — that's how the user sees their
         // drag highlight even on otherwise-blank space.
         for row in 0..grid.rows() {
+            // Selections store absolute (logical) coordinates so they survive
+            // scrolling; map this visible row to its logical row to test.
+            let logical_row = grid.view_to_logical(row);
             for col in 0..grid.cols() {
-                let selected = selection.map(|s| s.contains(row, col)).unwrap_or(false);
+                let selected =
+                    selection.map(|s| s.contains(logical_row, col)).unwrap_or(false);
                 let cell = grid.visible_cell(row, col);
                 let draw = if selected {
                     Some(SELECTION_BG)
@@ -329,12 +333,18 @@ impl Renderer {
         // At the block-cursor cell we invert fg/bg so the character reads
         // against the cursor background color.
         for row in 0..grid.rows() {
+            // Match pass 1: selections are in logical coordinates, so map the
+            // visible row before testing. Using the raw view row here would
+            // hand the LCD-blend shader the wrong background under selected
+            // glyphs (default bg instead of SELECTION_BG), fringing the text.
+            let logical_row = grid.view_to_logical(row);
             for col in 0..grid.cols() {
                 let cell = grid.visible_cell(row, col);
                 if cell.ch == ' ' {
                     continue;
                 }
-                let selected = selection.map(|s| s.contains(row, col)).unwrap_or(false);
+                let selected =
+                    selection.map(|s| s.contains(logical_row, col)).unwrap_or(false);
                 let at_block_cursor = matches!(cursor_shape, CursorShape::Block)
                     && cursor_cell == Some((row, col));
                 let (fg_color, bg_color) = if at_block_cursor {
