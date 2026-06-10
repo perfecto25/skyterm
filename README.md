@@ -306,6 +306,19 @@ single
 +---------------------+
 ```
 
+4 panes
+
+```
++---------+ +---------+
+|         |  |        |
+|         |  |        |
++---------+ +---------+
++---------+ +---------+
+|         |  |        |
+|         |  |        |
++---------+ +---------+
+```
+
 Pane layout can also be configured in skyterm config TOML (default is single pane)
 
     default_layout = single / 2v / 2h / 3 / 4
