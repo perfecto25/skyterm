@@ -39,6 +39,13 @@ pub struct Cell {
     pub ch: char,
     pub fg: CellColor,
     pub bg: CellColor,
+    /// Reverse video (SGR 7). Carried as a flag rather than pre-swapping fg/bg
+    /// at write time, because when fg/bg are `Default` the swap is a no-op until
+    /// the renderer resolves Default→theme colors. The renderer swaps the
+    /// resolved colors when this is set. Without this, ncurses apps that
+    /// highlight the selected row with `ESC[7m` over default colors (ncdu, less)
+    /// show no visible highlight at all.
+    pub inverse: bool,
 }
 
 impl Cell {
@@ -46,6 +53,7 @@ impl Cell {
         ch: ' ',
         fg: CellColor::Default,
         bg: CellColor::Default,
+        inverse: false,
     };
 }
 
@@ -692,12 +700,12 @@ impl Grid {
             self.linefeed();
             self.cursor_col = 0;
         }
-        let (fg, bg) = if self.reverse {
-            (self.current_bg, self.current_fg)
-        } else {
-            (self.current_fg, self.current_bg)
+        self.cells[self.cursor_row][self.cursor_col] = Cell {
+            ch,
+            fg: self.current_fg,
+            bg: self.current_bg,
+            inverse: self.reverse,
         };
-        self.cells[self.cursor_row][self.cursor_col] = Cell { ch, fg, bg };
         self.cursor_col += 1;
         self.bump_dirty();
     }
@@ -969,12 +977,15 @@ impl Grid {
     }
 
     fn blank_cell(&self) -> Cell {
-        let (fg, bg) = if self.reverse {
-            (self.current_bg, self.current_fg)
-        } else {
-            (self.current_fg, self.current_bg)
-        };
-        Cell { ch: ' ', fg, bg }
+        // Carries the current bg via the inverse flag so a reverse-mode erase
+        // (ESC[K while SGR 7 is active — ncdu's selected-row redraw) fills the
+        // cleared span with the highlight color rather than the default bg.
+        Cell {
+            ch: ' ',
+            fg: self.current_fg,
+            bg: self.current_bg,
+            inverse: self.reverse,
+        }
     }
 
     fn bump_dirty(&mut self) {

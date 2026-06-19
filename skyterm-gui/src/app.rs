@@ -835,6 +835,24 @@ fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
     }
     group.add_action(&new_tab_action);
 
+    // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs. Registered as accelerated actions
+    // rather than handled in the pane key controller because GTK reserves
+    // Ctrl+Tab for focus-group navigation and consumes it before a bubble-phase
+    // controller ever sees it — an app accelerator is processed ahead of that.
+    let next_tab_action = gio::SimpleAction::new("next-tab", None);
+    {
+        let state = state.clone();
+        next_tab_action.connect_activate(move |_, _| cycle_tab(&state, 1));
+    }
+    group.add_action(&next_tab_action);
+
+    let prev_tab_action = gio::SimpleAction::new("prev-tab", None);
+    {
+        let state = state.clone();
+        prev_tab_action.connect_activate(move |_, _| cycle_tab(&state, -1));
+    }
+    group.add_action(&prev_tab_action);
+
     // Spin up another top-level skyterm window inside the same `Application`.
     // Re-entering `on_activate` reuses the activation path the very first
     // window took, so a new-window window is identical to a freshly-launched
@@ -911,6 +929,9 @@ fn install_accelerators(app: &Application) {
         ("pane.split-vertical",   &["<Primary><Shift>e"]),
         ("pane.new-tab",          &["<Primary><Shift>t"]),
         ("pane.new-window",       &["<Primary><Shift>n"]),
+        // Tab cycling. <Primary>Tab is otherwise eaten by focus navigation.
+        ("pane.next-tab",         &["<Primary>Tab", "<Primary>Page_Down"]),
+        ("pane.prev-tab",         &["<Primary><Shift>Tab", "<Primary>Page_Up"]),
         // Clipboard. The same chords are also handled directly in
         // `wire_pane`'s key controller; the app-level binding takes
         // precedence and dispatches through `action_target` instead, which
@@ -930,6 +951,22 @@ fn install_accelerators(app: &Application) {
 fn current_tab(state: &Rc<WindowState>) -> Option<Rc<Tab>> {
     let idx = state.notebook.current_page()? as usize;
     state.tabs.borrow().get(idx).cloned()
+}
+
+/// Switch to the next (`delta = 1`) or previous (`delta = -1`) tab, wrapping
+/// around at the ends. The notebook's `switch_page` handler restores keyboard
+/// focus to that tab's last-focused pane, so we only move the page here. No-op
+/// with a single tab.
+fn cycle_tab(state: &Rc<WindowState>, delta: i32) {
+    let n = state.notebook.n_pages() as i32;
+    if n <= 1 {
+        return;
+    }
+    let Some(cur) = state.notebook.current_page() else {
+        return;
+    };
+    let next = (cur as i32 + delta).rem_euclid(n);
+    state.notebook.set_current_page(Some(next as u32));
 }
 
 fn tab_of_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) -> Option<Rc<Tab>> {
@@ -1948,11 +1985,22 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
             // In alt screen (vim, less, man without mouse mode): convert wheel
             // to arrow key sequences so the app can handle scrolling itself.
             // In the normal screen: scroll the scrollback view.
-            let in_alt = p.grid.borrow().is_alt_screen();
+            let (in_alt, app_cursor) = {
+                let g = p.grid.borrow();
+                (g.is_alt_screen(), g.app_cursor_keys)
+            };
             if in_alt {
                 let lines = (dy.abs() * 3.0).round().max(1.0) as usize;
-                // CSI A = cursor up, CSI B = cursor down.
-                let seq: &[u8] = if dy < 0.0 { b"\x1b[A" } else { b"\x1b[B" };
+                // Up = 'A', Down = 'B'. Must respect DECCKM: ncurses apps
+                // (ncdu, less, man) call keypad() → set app-cursor mode and
+                // only match the SS3 form (`ESC O x`); sending CSI (`ESC [ x`)
+                // to them is silently ignored, so the wheel does nothing.
+                let final_byte: u8 = if dy < 0.0 { b'A' } else { b'B' };
+                let seq: &[u8] = if app_cursor {
+                    &[0x1b, b'O', final_byte]
+                } else {
+                    &[0x1b, b'[', final_byte]
+                };
                 let mut w = p.writer.borrow_mut();
                 for _ in 0..lines {
                     let _ = w.write_all(seq);
@@ -4263,6 +4311,8 @@ fn keybinding_reference() -> Vec<(&'static str, &'static str)> {
         ("Ctrl + Shift + E", "Split vertically (new pane to the right)"),
         ("Ctrl + Shift + T", "Open a new tab"),
         ("Ctrl + Shift + N", "Open a new window"),
+        ("Ctrl + Tab", "Next tab (also Ctrl + Page Down)"),
+        ("Ctrl + Shift + Tab", "Previous tab (also Ctrl + Page Up)"),
         ("Ctrl + A + T", "Open a new tab (alternate shortcut)"),
         ("Ctrl + A + N", "Open a new window (alternate shortcut)"),
         ("Ctrl + Shift + W", "Close the focused pane"),

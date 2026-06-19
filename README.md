@@ -357,6 +357,12 @@ for MacOS builds
 
 ### Changelog
 
+#### 0.1.7
+- cycle tabs using Control + Tab (done)
+- fix Macos small pane size jitter bug
+- linux - ncdu not working, not scrolling up or down (done)
+
+
 #### 0.1.6
 
 - tabs are wider in size and can be dragged left or right

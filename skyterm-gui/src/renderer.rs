@@ -265,6 +265,11 @@ impl Renderer {
                 let cell = grid.visible_cell(row, col);
                 let draw = if selected {
                     Some(SELECTION_BG)
+                } else if cell.inverse {
+                    // Reverse video: the background takes the resolved foreground
+                    // color. Must draw even when cell.bg is Default — that's the
+                    // whole point of reverse over default colors (ncdu's row bar).
+                    Some(theme.resolve_fg(cell.fg))
                 } else if matches!(cell.bg, skyterm_core::theme::CellColor::Default) {
                     None
                 } else {
@@ -352,6 +357,11 @@ impl Renderer {
                     (theme.bg, theme.cursor)
                 } else if selected {
                     (theme.resolve_fg(cell.fg), SELECTION_BG)
+                } else if cell.inverse {
+                    // Reverse video: swap resolved fg/bg so the glyph reads in
+                    // the background color over the foreground-colored quad
+                    // drawn in pass 1.
+                    (theme.resolve_bg(cell.bg), theme.resolve_fg(cell.fg))
                 } else {
                     (theme.resolve_fg(cell.fg), theme.resolve_bg(cell.bg))
                 };
