@@ -1482,7 +1482,22 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
         rows as f64,
     );
     let scrollbar = Scrollbar::new(Orientation::Vertical, Some(&scroll_adj));
-    scrollbar.set_visible(false);
+    // The scrollbar is a layout sibling of the GLArea (in the horizontal `inner`
+    // box below), but its *footprint is constant*: it is always `visible` (so it
+    // always reserves its slot) and `sync_scrollbar` toggles only opacity +
+    // can_target, never visibility. Reason: toggling `set_visible` changed the
+    // pane's minimum size, and with `shrink_*_child(false)` on the split
+    // GtkPaned that made the divider oscillate forever whenever a pane was
+    // dragged very small (scrollback appears → scrollbar shown → min-size grows
+    // → paned grows the pane → reflow drains scrollback → scrollbar hidden →
+    // shrinks → repeat). Keeping it always allocated makes the min-size constant,
+    // so the loop can't form — at the cost of a thin always-reserved gutter.
+    // (An earlier fix floated it as an Overlay child, which removed it from
+    // min-size but put a targetable widget over the GLArea's right edge and
+    // broke pane drag-and-drop into the right/"vertical" drop slot — don't
+    // reintroduce that.)
+    scrollbar.set_opacity(0.0);
+    scrollbar.set_can_target(false);
 
     let pty_handle = match pty::spawn(cols, rows) {
         Ok(h) => h,
@@ -1550,7 +1565,9 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
     let overlay = gtk4::Overlay::new();
     overlay.set_child(Some(&gl_area));
     // Highlight first, toolbar second — toolbar must stay on top so the close
-    // button is clickable even while a drop highlight is showing.
+    // button is clickable even while a drop highlight is showing. The scrollbar
+    // is NOT an overlay: it's a sibling of the overlay in `inner` (below) so it
+    // never covers the GLArea, keeping pane drag-and-drop drop-slots clear.
     overlay.add_overlay(&drop_highlight);
     overlay.add_overlay(&toolbar);
     overlay.set_hexpand(true);
@@ -3596,7 +3613,14 @@ fn sync_scrollbar(pane: &Pane) {
     pane.scroll_adj.set_step_increment(1.0);
     pane.scroll_adj.set_value(value);
     pane.scroll_syncing.set(false);
-    pane.scrollbar.set_visible(sb > 0);
+    // Show/hide via opacity, not visibility: the scrollbar must stay allocated
+    // so its slot (and thus the pane's minimum size) is constant — otherwise a
+    // pane dragged very small oscillates between two divider positions. See the
+    // scrollbar setup in `make_pane`. can_target follows opacity so the empty
+    // gutter doesn't eat clicks / drag-and-drop when the scrollbar is hidden.
+    let show = sb > 0;
+    pane.scrollbar.set_opacity(if show { 1.0 } else { 0.0 });
+    pane.scrollbar.set_can_target(show);
 }
 
 /// Walk `~/.config/skyterm/themes/` and parse every `*.toml` file inside as
