@@ -388,3 +388,9 @@ for MacOS builds
 - add button few pixels to right of rightmost tab "new tab", should be able to create new tab via button (along w menu and KB shortcut)
 - ~~add ability to drag and drop panes in different locations, ie terminator behavior, move panes left, right etc~~
 - ~~add ability to drag a pane into a different tab, highlight the drop placement area on the new tab~~
+
+### Releasing
+
+    git tag -d v0.1.7
+    git tag v0.1.7
+    git push --force origin v0.1.7
