@@ -357,6 +357,11 @@ for MacOS builds
 
 ### Changelog
 
+#### 0.1.8
+- add Focus option, Control + A + F (makes current pane take up 90% of screen size) - similar to Waveterm Focus feature - in progress
+
+
+
 #### 0.1.7
 - cycle tabs using Control + Tab (done)
 - fix Macos small pane size jitter bug
