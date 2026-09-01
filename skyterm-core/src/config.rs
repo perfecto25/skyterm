@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -52,6 +53,18 @@ pub struct Config {
     /// `2h`, `2v`, `3`, `4`. `None` / absent means `single`.
     #[serde(default)]
     pub default_layout: Option<String>,
+    /// Which set of keyboard shortcuts is active: `skyterm` (default),
+    /// `terminator`, or `custom` (use `keybindings` below).
+    #[serde(default)]
+    pub shortcut_style: Option<String>,
+    /// Per-action key bindings used when `shortcut_style = "custom"`. Keys are
+    /// action ids (`split-horizontal`, `close`, `new-tab`, …); values are
+    /// comma-separated combos in the form `prefix+down`, `ctrl+shift+o`,
+    /// `alt+left` — where `prefix` means "after the Ctrl+A chord prefix". An
+    /// empty value leaves the action unbound; an absent action falls back to
+    /// its skyterm default.
+    #[serde(default)]
+    pub keybindings: Option<BTreeMap<String, String>>,
 }
 
 impl Config {
@@ -87,5 +100,52 @@ impl Config {
         let text = toml::to_string_pretty(self)?;
         fs::write(path, text)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `keybindings` is a TOML *table*, and the serializer rejects a plain
+    /// value emitted after one — so it has to stay the last field in the
+    /// struct. This test fails loudly if someone appends a field below it.
+    #[test]
+    fn full_config_round_trips_through_toml() {
+        let mut keys = BTreeMap::new();
+        keys.insert("close".to_string(), "prefix+x".to_string());
+        keys.insert("new-tab".to_string(), String::new());
+        let cfg = Config {
+            font_path: Some(PathBuf::from("/usr/share/fonts/x.ttf")),
+            font_size: Some(16),
+            theme_name: Some("Skyterm Blue".to_string()),
+            scrollback_lines: Some(9000),
+            cursor_blink: Some(true),
+            click_word_select: Some(true),
+            copy_on_select: Some(false),
+            tab_max_number: Some(8),
+            confirm_tab_close: Some(true),
+            confirm_pane_close: Some(false),
+            confirm_window_close: Some(true),
+            show_pane_toolbar: Some(true),
+            default_layout: Some("2v".to_string()),
+            shortcut_style: Some("custom".to_string()),
+            keybindings: Some(keys.clone()),
+        };
+        let text = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("deserialize");
+        assert_eq!(back.shortcut_style.as_deref(), Some("custom"));
+        assert_eq!(back.keybindings, Some(keys));
+        assert_eq!(back.default_layout.as_deref(), Some("2v"));
+    }
+
+    /// A config written by an older skyterm has neither new key, and must keep
+    /// loading rather than resetting everything to defaults.
+    #[test]
+    fn config_without_keybinding_fields_still_loads() {
+        let cfg: Config = toml::from_str("font_size = 14\ntheme_name = \"Dracula\"\n").unwrap();
+        assert_eq!(cfg.font_size, Some(14));
+        assert!(cfg.shortcut_style.is_none());
+        assert!(cfg.keybindings.is_none());
     }
 }

@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -21,6 +22,7 @@ use skyterm_core::{
 
 use crate::font;
 use crate::input;
+use crate::keymap::{self, Action, Binding, Keymap, ShortcutStyle};
 use crate::pty;
 use crate::renderer::{Renderer, Selection};
 
@@ -311,12 +313,52 @@ struct WindowState {
     /// menus / banners can be re-substituted when the user picks a different
     /// terminal font in Settings.
     css_provider: CssProvider,
+    /// Active key bindings. Rebuilt (and re-pushed to GTK as accelerators via
+    /// [`apply_accelerators`]) whenever the shortcut style changes or a custom
+    /// binding is recorded in Settings.
+    keymap: RefCell<Keymap>,
+    /// The user's recorded per-action bindings (action id → comma-separated
+    /// combos). Only consulted while the style is `Custom`; kept around
+    /// regardless so switching styles back and forth doesn't lose them.
+    custom_keys: RefCell<BTreeMap<String, String>>,
+}
+
+/// Saved layout for a tab in focus mode (see [`enter_focus_mode`]). Holding an
+/// `Rc<Pane>` keeps the zoomed pane alive, so anything that can destroy a pane
+/// or reshape the tree must call [`leave_focus_mode`] first.
+struct PaneZoom {
+    /// The enlarged pane.
+    pane: Rc<Pane>,
+    /// Every `GtkPaned` between that pane and the tab root — innermost first.
+    saved: Vec<PanedSave>,
+}
+
+/// One divider's pre-focus-mode state. `extent` is recorded next to `position`
+/// so the restore can scale it: the window can be maximized or resized while
+/// focus mode is on (`Ctrl+A + ]` is one keystroke away), and dropping a raw
+/// pixel position back into a differently-sized `GtkPaned` would put the
+/// divider in the wrong place.
+struct PanedSave {
+    paned: Paned,
+    position: i32,
+    extent: i32,
+}
+
+/// A `GtkPaned`'s size along the axis its divider travels.
+fn paned_extent(paned: &Paned) -> i32 {
+    match paned.orientation() {
+        Orientation::Horizontal => paned.width(),
+        _ => paned.height(),
+    }
 }
 
 struct Tab {
     /// The notebook page widget — holds the pane tree root.
     container: gtk4::Box,
     panes: RefCell<Vec<Rc<Pane>>>,
+    /// `Some` while this tab is in focus mode. Focus mode is per-tab: zooming
+    /// in one tab leaves the others alone.
+    zoom: RefCell<Option<PaneZoom>>,
     /// Which pane was last focused inside this tab. Restored when switching
     /// back to the tab.
     focused: RefCell<Option<Rc<Pane>>>,
@@ -362,6 +404,17 @@ struct Pane {
     /// Pending debounced reflow timer (see `schedule_reflow`). Holds the latest
     /// timeout so a burst of resize events collapses into one grid+PTY resize.
     resize_source: RefCell<Option<glib::SourceId>>,
+    /// This pane's right-click menu, kept so `Action::ShowMenu` can raise the
+    /// same popover from the keyboard. Set by `wire_pane`, so it is `None` for
+    /// the brief window between construction and wiring.
+    menu_popover: RefCell<Option<PopoverMenu>>,
+    /// While true, `schedule_reflow` is a no-op for this pane. Set on the panes
+    /// that focus mode squeezes down to a sliver: their allocation shrinks to
+    /// almost nothing, and reflowing the grid + PTY to 1 column (then back)
+    /// would mangle their contents and SIGWINCH-storm whatever is running in
+    /// them. The grid keeps the size it had, and the renderer just draws it
+    /// clipped to the visible sliver.
+    reflow_frozen: Cell<bool>,
     /// Multi-click tracking for word/line selection: (last press time in ms,
     /// row, col, consecutive count). Used to distinguish single/double/triple
     /// clicks on the left button without a separate `GestureClick`.
@@ -442,6 +495,9 @@ pub fn on_activate(app: &Application) {
     let splits = gio::Menu::new();
     splits.append(Some("― Split Horizontally"), Some("pane.split-horizontal"));
     splits.append(Some("| Split Vertically"),  Some("pane.split-vertical"));
+    // Toggle: enlarges the clicked pane over the rest, or restores the layout
+    // if it's already enlarged. Does nothing in a tab with one pane.
+    splits.append(Some("⛶ Focus Pane"),        Some("pane.focus-pane"));
 
     // Layouts submenu — each opens a new tab pre-split into the chosen preset.
     // "single" is omitted (that's just New Tab).
@@ -455,6 +511,11 @@ pub fn on_activate(app: &Application) {
 
     splits.append(Some("New Tab"),            Some("pane.new-tab"));
     splits.append(Some("New Window"),         Some("pane.new-window"));
+
+    // Window state — its own section so it reads apart from the pane/tab items.
+    let window_state = gio::Menu::new();
+    window_state.append(Some("Maximize Window"), Some("pane.maximize"));
+    window_state.append(Some("Minimize Window"), Some("pane.minimize"));
 
     let clipboard = gio::Menu::new();
     clipboard.append(Some("Copy"), Some("pane.copy"));
@@ -490,6 +551,7 @@ pub fn on_activate(app: &Application) {
 
     let prefs = gio::Menu::new();
     prefs.append_submenu(Some("Themes"), &themes_submenu);
+    prefs.append(Some("Shortcuts…"), Some("pane.show-shortcuts"));
     prefs.append(Some("Settings…"), Some("pane.settings"));
     prefs.append(Some("About…"), Some("pane.about"));
 
@@ -502,12 +564,14 @@ pub fn on_activate(app: &Application) {
 
     let split_menu = gio::Menu::new();
     split_menu.append_section(None, &splits);
+    split_menu.append_section(None, &window_state);
     split_menu.append_section(None, &clipboard);
     split_menu.append_section(None, &prefs);
     split_menu.append_section(None, &danger);
 
     let split_menu_no_close = gio::Menu::new();
     split_menu_no_close.append_section(None, &splits);
+    split_menu_no_close.append_section(None, &window_state);
     split_menu_no_close.append_section(None, &clipboard);
     split_menu_no_close.append_section(None, &prefs);
 
@@ -569,6 +633,12 @@ pub fn on_activate(app: &Application) {
         .clone()
         .unwrap_or_else(|| "single".to_string());
 
+    // Keyboard bindings: a style name plus (for "custom") the user's recorded
+    // per-action overrides. Missing / unknown style → skyterm's own set.
+    let custom_keys = cfg.keybindings.clone().unwrap_or_default();
+    let shortcut_style = ShortcutStyle::from_id(cfg.shortcut_style.as_deref().unwrap_or(""));
+    let keymap = Keymap::new(shortcut_style, &custom_keys);
+
     let state = Rc::new(WindowState {
         tabs: RefCell::new(Vec::new()),
         chord_at: Cell::new(None),
@@ -597,6 +667,8 @@ pub fn on_activate(app: &Application) {
         force_close: Cell::new(false),
         dragging: RefCell::new(None),
         css_provider,
+        keymap: RefCell::new(keymap),
+        custom_keys: RefCell::new(custom_keys),
     });
 
     // Dismiss button on the tab-max banner.
@@ -661,7 +733,7 @@ pub fn on_activate(app: &Application) {
     }
 
     install_pane_actions(&window, &state);
-    install_accelerators(app);
+    apply_accelerators(&state);
 
     // Tab switch → restore keyboard focus to that tab's last-focused pane.
     {
@@ -746,22 +818,25 @@ fn action_target(state: &Rc<WindowState>) -> Option<Rc<Pane>> {
 fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
     let group = gio::SimpleActionGroup::new();
 
-    // Two named splits matching the menu items. "Horizontal" = horizontal
-    // divider = new pane below (SplitDir::Down); "Vertical" = vertical
-    // divider = new pane to the right (SplitDir::Right). Mirrors the
-    // Terminator convention the user is migrating from.
-    for (name, dir) in [
-        ("split-horizontal", SplitDir::Down),
-        ("split-vertical", SplitDir::Right),
-    ] {
-        let action = gio::SimpleAction::new(name, None);
+    // Every keyboard-bindable operation gets a `pane.<id>` action, so the
+    // right-click menu, the accelerators built from the keymap, and the chord
+    // handler all funnel into the same [`run_action`] dispatch. Action ids
+    // double as the keymap / config ids — see `keymap::Action::id`.
+    for action in Action::all() {
+        let action = *action;
+        let gaction = gio::SimpleAction::new(action.id(), None);
         let state = state.clone();
-        action.connect_activate(move |_, _| {
-            if let Some(target) = action_target(&state) {
-                split(&state, &target, dir);
-            }
+        gaction.connect_activate(move |_, _| {
+            // Font zoom is defined as "the focused pane" — it has no menu item,
+            // so it must not inherit `menu_target`, which sticks around after
+            // the popover closes and would zoom a stale pane.
+            let target = match action {
+                Action::ZoomIn | Action::ZoomOut | Action::ZoomReset => focused_pane(&state),
+                _ => action_target(&state),
+            };
+            run_action(&state, target.as_ref(), action);
         });
-        group.add_action(&action);
+        group.add_action(&gaction);
     }
 
     // Layouts: open a new tab and build the chosen preset arrangement in it.
@@ -781,92 +856,6 @@ fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
         });
     }
     group.add_action(&layout_action);
-
-    let close = gio::SimpleAction::new("close", None);
-    {
-        let state = state.clone();
-        close.connect_activate(move |_, _| {
-            if let Some(target) = action_target(&state) {
-                request_close_pane(&state, &target);
-            }
-        });
-    }
-    group.add_action(&close);
-
-    let copy = gio::SimpleAction::new("copy", None);
-    {
-        let state = state.clone();
-        copy.connect_activate(move |_, _| {
-            if let Some(target) = action_target(&state) {
-                copy_selection(&target);
-            }
-        });
-    }
-    group.add_action(&copy);
-
-    let paste_action = gio::SimpleAction::new("paste", None);
-    {
-        let state = state.clone();
-        paste_action.connect_activate(move |_, _| {
-            if let Some(target) = action_target(&state) {
-                paste(&target, false);
-            }
-        });
-    }
-    group.add_action(&paste_action);
-
-    let select_all = gio::SimpleAction::new("select-all", None);
-    {
-        let state = state.clone();
-        select_all.connect_activate(move |_, _| {
-            if let Some(target) = action_target(&state) {
-                select_all_pane(&target);
-            }
-        });
-    }
-    group.add_action(&select_all);
-
-    let new_tab_action = gio::SimpleAction::new("new-tab", None);
-    {
-        let state = state.clone();
-        new_tab_action.connect_activate(move |_, _| {
-            new_tab(&state);
-        });
-    }
-    group.add_action(&new_tab_action);
-
-    // Ctrl+Tab / Ctrl+Shift+Tab cycle tabs. Registered as accelerated actions
-    // rather than handled in the pane key controller because GTK reserves
-    // Ctrl+Tab for focus-group navigation and consumes it before a bubble-phase
-    // controller ever sees it — an app accelerator is processed ahead of that.
-    let next_tab_action = gio::SimpleAction::new("next-tab", None);
-    {
-        let state = state.clone();
-        next_tab_action.connect_activate(move |_, _| cycle_tab(&state, 1));
-    }
-    group.add_action(&next_tab_action);
-
-    let prev_tab_action = gio::SimpleAction::new("prev-tab", None);
-    {
-        let state = state.clone();
-        prev_tab_action.connect_activate(move |_, _| cycle_tab(&state, -1));
-    }
-    group.add_action(&prev_tab_action);
-
-    // Spin up another top-level skyterm window inside the same `Application`.
-    // Re-entering `on_activate` reuses the activation path the very first
-    // window took, so a new-window window is identical to a freshly-launched
-    // one (fresh config load, fresh tab, its own pane tree).
-    let new_window_action = gio::SimpleAction::new("new-window", None);
-    {
-        let state = state.clone();
-        new_window_action.connect_activate(move |_, _| {
-            if let Some(app) = state.window.application() {
-                on_activate(&app);
-            }
-        });
-    }
-    group.add_action(&new_window_action);
 
     let settings_action = gio::SimpleAction::new("settings", None);
     {
@@ -917,32 +906,159 @@ fn install_pane_actions(window: &ApplicationWindow, state: &Rc<WindowState>) {
     window.insert_action_group("pane", Some(&group));
 }
 
-/// Register application-level keyboard accelerators for the menu actions.
-/// GTK4 auto-renders the accel string next to the corresponding menu items
-/// (in a dimmed colour, Terminator-style), and routes the keypress to the
-/// `pane.*` action group on the window. Uses `<Primary>` so the modifier
-/// resolves to Ctrl on Linux/Windows and ⌘ on macOS.
-fn install_accelerators(app: &Application) {
-    let bindings: &[(&str, &[&str])] = &[
-        // Splits + new tab — Terminator-compatible chords.
-        ("pane.split-horizontal", &["<Primary><Shift>o"]),
-        ("pane.split-vertical",   &["<Primary><Shift>e"]),
-        ("pane.new-tab",          &["<Primary><Shift>t"]),
-        ("pane.new-window",       &["<Primary><Shift>n"]),
-        // Tab cycling. <Primary>Tab is otherwise eaten by focus navigation.
-        ("pane.next-tab",         &["<Primary>Tab", "<Primary>Page_Down"]),
-        ("pane.prev-tab",         &["<Primary><Shift>Tab", "<Primary>Page_Up"]),
-        // Clipboard. The same chords are also handled directly in
-        // `wire_pane`'s key controller; the app-level binding takes
-        // precedence and dispatches through `action_target` instead, which
-        // routes to the focused pane just like the menu path does.
-        ("pane.copy",             &["<Primary><Shift>c"]),
-        ("pane.paste",            &["<Primary><Shift>v"]),
-        ("pane.select-all",       &["<Primary><Shift>a"]),
-        ("pane.close",            &["<Primary><Shift>w"]),
-    ];
-    for (action, keys) in bindings {
-        app.set_accels_for_action(action, keys);
+/// Push every non-chord binding in the active keymap to GTK as an
+/// application-level accelerator. GTK renders the accel string next to the
+/// matching right-click menu item (dimmed) and routes the keypress to the
+/// `pane.*` action group on the window — which beats the pane's own key
+/// controller, so accelerated combos never reach the PTY.
+///
+/// Every action is set on every call, unbound ones to an empty list, so
+/// switching styles clears the accelerators the previous style installed.
+/// Accelerators live on the `Application`, i.e. they're shared by all windows
+/// — which matches the config being global.
+fn apply_accelerators(state: &Rc<WindowState>) {
+    let Some(app) = state.window.application() else {
+        return;
+    };
+    let km = state.keymap.borrow();
+    for action in Action::all() {
+        let accels = km.accels(*action);
+        let refs: Vec<&str> = accels.iter().map(|s| s.as_str()).collect();
+        app.set_accels_for_action(&format!("pane.{}", action.id()), &refs);
+    }
+}
+
+/// Rebuild the keymap from the given style and re-install its accelerators.
+/// Called from the Settings ▸ Keybindings tab.
+fn apply_shortcut_style(state: &Rc<WindowState>, style: ShortcutStyle) {
+    let keymap = Keymap::new(style, &state.custom_keys.borrow());
+    *state.keymap.borrow_mut() = keymap;
+    apply_accelerators(state);
+}
+
+/// Run one keyboard action. The single dispatch point for all three entry
+/// paths: the right-click menu / accelerators (via the `pane.*` GActions), and
+/// the second key of an armed `Ctrl+A` chord.
+///
+/// `pane` is the target for pane-scoped actions; window-scoped ones (new tab,
+/// tab cycling, focus movement) run even without one.
+fn run_action(state: &Rc<WindowState>, pane: Option<&Rc<Pane>>, action: Action) {
+    // Window-scoped first — these don't need a target pane.
+    match action {
+        Action::NewTab => {
+            new_tab(state);
+            return;
+        }
+        // Spin up another top-level skyterm window inside the same
+        // `Application`. Re-entering `on_activate` reuses the activation path
+        // the very first window took, so a new-window window is identical to a
+        // freshly-launched one (fresh config load, fresh tab, its own panes).
+        Action::NewWindow => {
+            if let Some(app) = state.window.application() {
+                on_activate(&app);
+            }
+            return;
+        }
+        // Window state. Maximize toggles, so the same chord gets you back out
+        // — important because a maximized window with server-side decorations
+        // off has no title-bar button to undo it. Minimize has no inverse: the
+        // window is gone until the desktop's taskbar / switcher brings it back.
+        Action::MaximizeWindow => {
+            if state.window.is_maximized() {
+                state.window.unmaximize();
+            } else {
+                state.window.maximize();
+            }
+            return;
+        }
+        Action::MinimizeWindow => {
+            state.window.minimize();
+            return;
+        }
+        // Standalone shortcut reference — window-scoped, no target pane needed.
+        Action::ShowShortcuts => {
+            open_shortcuts(state);
+            return;
+        }
+        Action::NextTab => {
+            cycle_tab(state, 1);
+            return;
+        }
+        Action::PrevTab => {
+            cycle_tab(state, -1);
+            return;
+        }
+        Action::FocusNext => {
+            focus_next_pane(state);
+            return;
+        }
+        Action::FocusLeft => {
+            focus_direction(state, SplitDir::Left);
+            return;
+        }
+        Action::FocusDown => {
+            focus_direction(state, SplitDir::Down);
+            return;
+        }
+        Action::FocusUp => {
+            focus_direction(state, SplitDir::Up);
+            return;
+        }
+        Action::FocusRight => {
+            focus_direction(state, SplitDir::Right);
+            return;
+        }
+        _ => {}
+    }
+
+    let Some(pane) = pane else {
+        return;
+    };
+    match action {
+        Action::SplitDown => {
+            split(state, pane, SplitDir::Down);
+        }
+        Action::SplitRight => {
+            split(state, pane, SplitDir::Right);
+        }
+        Action::SplitUp => {
+            split(state, pane, SplitDir::Up);
+        }
+        Action::SplitLeft => {
+            split(state, pane, SplitDir::Left);
+        }
+        Action::FocusPane => toggle_focus_pane(state, pane),
+        Action::ClosePane => request_close_pane(state, pane),
+        Action::Copy => copy_selection(pane),
+        Action::Paste => paste(pane, false),
+        Action::SelectAll => select_all_pane(pane),
+        Action::ShowMenu => show_pane_menu(state, pane, None),
+        Action::ThemePrev => cycle_theme(state, pane, -1),
+        Action::ThemeNext => cycle_theme(state, pane, 1),
+        Action::ZoomIn => change_font_size(pane, 1),
+        Action::ZoomOut => change_font_size(pane, -1),
+        Action::ZoomReset => change_font_size(pane, 0),
+        // Prefix-twice → pass a literal Ctrl+A (0x01) through to the PTY.
+        // Matches tmux's `send-prefix`.
+        Action::SendPrefix => {
+            snap_to_bottom(pane);
+            let mut w = pane.writer.borrow_mut();
+            let _ = w.write_all(&[0x01]);
+            let _ = w.flush();
+        }
+        // Handled above.
+        Action::NewTab
+        | Action::NewWindow
+        | Action::MaximizeWindow
+        | Action::MinimizeWindow
+        | Action::ShowShortcuts
+        | Action::NextTab
+        | Action::PrevTab
+        | Action::FocusNext
+        | Action::FocusLeft
+        | Action::FocusDown
+        | Action::FocusUp
+        | Action::FocusRight => {}
     }
 }
 
@@ -1242,6 +1358,7 @@ fn make_tab(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Tab>> {
     let tab = Rc::new(Tab {
         container,
         panes: RefCell::new(vec![pane.clone()]),
+        zoom: RefCell::new(None),
         focused: RefCell::new(Some(pane.clone())),
         tab_label,
     });
@@ -1604,6 +1721,8 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
         is_focused: Cell::new(false),
         resize_source: RefCell::new(None),
         click_state: Cell::new((0, 0, 0, 0)),
+        menu_popover: RefCell::new(None),
+        reflow_frozen: Cell::new(false),
         autoscroll_source: RefCell::new(None),
         autoscroll_params: Cell::new((false, 0.0)),
         _child: RefCell::new(pty_handle.child),
@@ -1827,6 +1946,10 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
 fn schedule_reflow(p: &Rc<Pane>) {
     if let Some(id) = p.resize_source.borrow_mut().take() {
         id.remove();
+    }
+    // Squeezed by focus mode — keep the grid and PTY at the size they had.
+    if p.reflow_frozen.get() {
+        return;
     }
     let pane_w = Rc::downgrade(p);
     let id = glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
@@ -2255,10 +2378,21 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
     // default max-content-height is small enough that our 6-item menu
     // overflows and gets a scrollbar. Override on every show — the inner
     // widgets are created lazily so we can't catch them at construction.
-    popover.connect_show(|p| {
-        unconstrain_scrolled_windows(p.upcast_ref::<gtk4::Widget>());
-        colorize_menu_items(p.upcast_ref::<gtk4::Widget>());
-    });
+    {
+        let state_w = Rc::downgrade(state);
+        popover.connect_show(move |p| {
+            unconstrain_scrolled_windows(p.upcast_ref::<gtk4::Widget>());
+            colorize_menu_items(p.upcast_ref::<gtk4::Widget>());
+            // Drop GTK's automatic accelerator hints when they'd only apply to
+            // some of the items (see `menu_accels_useful`). Done on every show
+            // because the items are rebuilt when the menu model is swapped.
+            if let Some(state) = state_w.upgrade() {
+                if !menu_accels_useful(&state) {
+                    hide_menu_accels(p.upcast_ref::<gtk4::Widget>());
+                }
+            }
+        });
+    }
     // `visible-submenu` fires synchronously on GTK4 4.8+; belt-and-suspenders
     // for versions where it works.
     popover.connect_notify_local(Some("visible-submenu"), |p, _| {
@@ -2289,45 +2423,18 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
         });
         popover.add_child(&close_btn, "close-pane");
     }
+    // Hold onto the popover so the keyboard path (`Ctrl+A + Enter`) can raise
+    // the very same menu the right-click gesture does.
+    *pane.menu_popover.borrow_mut() = Some(popover.clone());
     {
         let state = state.clone();
         let pane_w = Rc::downgrade(pane);
-        let popover = popover.clone();
         let right = GestureClick::new();
         right.set_button(gdk::BUTTON_SECONDARY);
         right.connect_pressed(move |_, _n, x, y| {
-            let Some(p) = pane_w.upgrade() else {
-                return;
-            };
-            // Right-click also focuses the pane — matches the user's mental
-            // model of "the menu acts on the thing I clicked on".
-            focus_pane(&state, &p);
-            // The popover lives on the window; translate the click point
-            // from gl_area coords into window coords for pointing_to.
-            let point = gtk4::graphene::Point::new(x as f32, y as f32);
-            let (px, py) = p
-                .gl_area
-                .compute_point(&state.window, &point)
-                .map(|p| (p.x() as f64, p.y() as f64))
-                .unwrap_or((x, y));
-            *state.menu_target.borrow_mut() = Some(p);
-            // Swap in the menu variant that matches the current state: hide
-            // "Close pane" only when closing it would empty the entire
-            // window (i.e. last pane in last tab). With multiple tabs, the
-            // close action just closes the tab.
-            let tabs = state.tabs.borrow().len();
-            let panes_here = current_tab(&state)
-                .map(|t| t.panes.borrow().len())
-                .unwrap_or(0);
-            let model = if tabs > 1 || panes_here > 1 {
-                &state.split_menu
-            } else {
-                &state.split_menu_no_close
-            };
-            popover.set_menu_model(Some(model));
-            let rect = gdk::Rectangle::new(px as i32, py as i32, 1, 1);
-            popover.set_pointing_to(Some(&rect));
-            popover.popup();
+            if let Some(p) = pane_w.upgrade() {
+                show_pane_menu(&state, &p, Some((x, y)));
+            }
         });
         pane.gl_area.add_controller(right);
     }
@@ -2425,73 +2532,19 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
                     return glib::Propagation::Stop;
                 }
                 state.chord_at.set(None);
-                // Prefix-twice → pass literal Ctrl+A (0x01) through to the
-                // PTY. Matches tmux's `send-prefix`.
-                if modifiers.contains(gdk::ModifierType::CONTROL_MASK)
-                    && matches!(keyval, gdk::Key::a | gdk::Key::A)
-                {
-                    snap_to_bottom(&p);
-                    let mut w = p.writer.borrow_mut();
-                    let _ = w.write_all(&[0x01]);
-                    let _ = w.flush();
-                    return glib::Propagation::Stop;
-                }
-                // `t` opens a new tab.
-                if matches!(keyval, gdk::Key::t | gdk::Key::T) {
-                    new_tab(&state);
-                    return glib::Propagation::Stop;
-                }
-                // `n` opens a new top-level window.
-                if matches!(keyval, gdk::Key::n | gdk::Key::N) {
-                    if let Some(app) = state.window.application() {
-                        on_activate(&app);
+                // Resolve first, then drop the keymap borrow — `run_action` can
+                // reach a long way (new window, confirm dialogs).
+                let action = state.keymap.borrow().chord_action(modifiers, keyval);
+                if let Some(action) = action {
+                    // Theme cycling *re-arms* the chord so the user can
+                    // rapid-scroll by holding Ctrl+A and tapping ' / /
+                    // repeatedly without hitting the full 3-key combo each
+                    // time. Any other key (or the 2 s timeout) disarms.
+                    let rearm = matches!(action, Action::ThemePrev | Action::ThemeNext);
+                    run_action(&state, Some(&p), action);
+                    if rearm {
+                        state.chord_at.set(Some(Instant::now()));
                     }
-                    return glib::Propagation::Stop;
-                }
-                // `o` cycles focus to the next pane in the current tab.
-                if matches!(keyval, gdk::Key::o | gdk::Key::O) {
-                    focus_next_pane(&state);
-                    return glib::Propagation::Stop;
-                }
-                // h/j/k/l move focus to the spatially-closest pane in that
-                // direction (vim-style; arrows are reserved for splitting).
-                let focus_dir = match keyval {
-                    gdk::Key::h | gdk::Key::H => Some(SplitDir::Left),
-                    gdk::Key::j | gdk::Key::J => Some(SplitDir::Down),
-                    gdk::Key::k | gdk::Key::K => Some(SplitDir::Up),
-                    gdk::Key::l | gdk::Key::L => Some(SplitDir::Right),
-                    _ => None,
-                };
-                if let Some(dir) = focus_dir {
-                    focus_direction(&state, dir);
-                    return glib::Propagation::Stop;
-                }
-                // ' (apostrophe) — previous theme; / (slash) — next theme.
-                // Wraps around the combined built-in + user theme list and
-                // persists the new selection to config. The chord is *re-armed*
-                // after firing so the user can rapid-scroll by holding Ctrl+A
-                // and tapping ' / / repeatedly without having to hit the full
-                // 3-key combo every time. Any non-cycle key (or the 2s timeout
-                // expiring) disarms the chord normally.
-                let delta = match keyval {
-                    gdk::Key::apostrophe => Some(-1),
-                    gdk::Key::slash => Some(1),
-                    _ => None,
-                };
-                if let Some(d) = delta {
-                    cycle_theme(&state, &p, d);
-                    state.chord_at.set(Some(Instant::now()));
-                    return glib::Propagation::Stop;
-                }
-                let dir = match keyval {
-                    gdk::Key::Up => Some(SplitDir::Up),
-                    gdk::Key::Down => Some(SplitDir::Down),
-                    gdk::Key::Left => Some(SplitDir::Left),
-                    gdk::Key::Right => Some(SplitDir::Right),
-                    _ => None,
-                };
-                if let Some(dir) = dir {
-                    split(&state, &p, dir);
                 }
                 // Swallow any unrecognized key after the prefix.
                 return glib::Propagation::Stop;
@@ -2502,6 +2555,8 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
             // beginning-of-line on Ctrl+A keeps working. ⌘A's usual Mac
             // meaning (Select All) is unused inside a terminal grid, so we
             // appropriate it as the chord prefix to mirror Linux's UX.
+            // Styles with no prefix bindings at all (Terminator) skip this, so
+            // Ctrl+A reaches the shell as readline's beginning-of-line.
             let chord_mod = if cfg!(target_os = "macos") {
                 gdk::ModifierType::META_MASK
             } else {
@@ -2509,50 +2564,18 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
             };
             if modifiers.contains(chord_mod)
                 && matches!(keyval, gdk::Key::a | gdk::Key::A)
+                && state.keymap.borrow().prefix_enabled()
             {
                 state.chord_at.set(Some(Instant::now()));
                 return glib::Propagation::Stop;
             }
 
-            // 3) Ctrl+Shift+C — copy the current selection to the clipboard.
-            if modifiers.contains(gdk::ModifierType::CONTROL_MASK)
-                && modifiers.contains(gdk::ModifierType::SHIFT_MASK)
-                && matches!(keyval, gdk::Key::c | gdk::Key::C)
-            {
-                copy_selection(&p);
-                return glib::Propagation::Stop;
-            }
+            // Non-chord bindings (Ctrl+Shift+C/V, Ctrl+±, …) never get here:
+            // they're installed as application accelerators from the keymap by
+            // `apply_accelerators`, and GTK dispatches those ahead of this
+            // bubble-phase controller.
 
-            // 4) Ctrl+Shift+V — paste from system clipboard.
-            if modifiers.contains(gdk::ModifierType::CONTROL_MASK)
-                && modifiers.contains(gdk::ModifierType::SHIFT_MASK)
-                && matches!(keyval, gdk::Key::v | gdk::Key::V)
-            {
-                paste(&p, false);
-                return glib::Propagation::Stop;
-            }
-
-            // 5) Ctrl+± font zoom on the focused pane.
-            if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
-                let target = focused_pane(&state).unwrap_or_else(|| p.clone());
-                match keyval {
-                    gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => {
-                        change_font_size(&target, 1);
-                        return glib::Propagation::Stop;
-                    }
-                    gdk::Key::minus | gdk::Key::KP_Subtract => {
-                        change_font_size(&target, -1);
-                        return glib::Propagation::Stop;
-                    }
-                    gdk::Key::_0 | gdk::Key::KP_0 => {
-                        change_font_size(&target, 0);
-                        return glib::Propagation::Stop;
-                    }
-                    _ => {}
-                }
-            }
-
-            // 6) Default: encode the keystroke and write to the PTY. Typing
+            // 3) Default: encode the keystroke and write to the PTY. Typing
             // input also clears the selection — the user has clearly moved
             // on from "I'm picking text to copy" — and snaps the view back
             // to the live screen if they were scrolled up.
@@ -2573,10 +2596,68 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
     pane.gl_area.add_controller(key_controller);
 }
 
+/// Raise `pane`'s context menu. `at` is a point in the pane's own coordinates
+/// — where the right-click landed, or `None` for the keyboard shortcut, which
+/// points at the middle of the pane.
+///
+/// The popover is parented to the toplevel window rather than the pane's
+/// `GLArea` (GTK4 sizes popovers inside their parent's allocation, and a small
+/// split pane would squash the menu), so the point has to be translated into
+/// window coordinates.
+fn show_pane_menu(state: &Rc<WindowState>, pane: &Rc<Pane>, at: Option<(f64, f64)>) {
+    let Some(popover) = pane.menu_popover.borrow().clone() else {
+        return;
+    };
+    // Acting on the pane also focuses it — matches the user's mental model of
+    // "the menu acts on the thing I pointed at".
+    focus_pane(state, pane);
+    let (x, y) = at.unwrap_or_else(|| {
+        (
+            pane.gl_area.width() as f64 / 2.0,
+            pane.gl_area.height() as f64 / 2.0,
+        )
+    });
+    let point = gtk4::graphene::Point::new(x as f32, y as f32);
+    let (px, py) = pane
+        .gl_area
+        .compute_point(&state.window, &point)
+        .map(|p| (p.x() as f64, p.y() as f64))
+        .unwrap_or((x, y));
+    *state.menu_target.borrow_mut() = Some(pane.clone());
+    // Swap in the menu variant that matches the current state: hide "Close
+    // pane" only when closing it would empty the entire window (i.e. last pane
+    // in last tab). With multiple tabs, the close action just closes the tab.
+    let tabs = state.tabs.borrow().len();
+    let panes_here = current_tab(state)
+        .map(|t| t.panes.borrow().len())
+        .unwrap_or(0);
+    let model = if tabs > 1 || panes_here > 1 {
+        &state.split_menu
+    } else {
+        &state.split_menu_no_close
+    };
+    popover.set_menu_model(Some(model));
+    let rect = gdk::Rectangle::new(px as i32, py as i32, 1, 1);
+    popover.set_pointing_to(Some(&rect));
+    popover.popup();
+}
+
 fn focus_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
     let Some(tab) = tab_of_pane(state, pane) else {
         return;
     };
+    // Moving focus somewhere else ends focus mode: the pane being focused is a
+    // few-pixel sliver right now, and leaving it focused-but-invisible is a
+    // dead end for the user.
+    let zoomed_elsewhere = tab
+        .zoom
+        .borrow()
+        .as_ref()
+        .map(|z| !Rc::ptr_eq(&z.pane, pane))
+        .unwrap_or(false);
+    if zoomed_elsewhere {
+        leave_focus_mode(&tab);
+    }
     // Swap the tab's focus highlight from the previous pane (if any in this
     // tab) to the new one.
     let prev = tab.focused.borrow().clone();
@@ -2602,10 +2683,158 @@ fn focus_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
     pane.gl_area.grab_focus();
 }
 
+/// Share of each divider's travel handed to the focused pane's side in focus
+/// mode, as a percentage. The remaining 10% keeps a visible sliver of the
+/// squeezed panes, so it reads as "this pane is on top of the others" rather
+/// than "the other panes are gone". A fixed pixel peek doesn't work: the
+/// `GtkPaned` handle eats most of a small remainder and the sliver collapses
+/// to nothing.
+const FOCUS_PERCENT: i32 = 90;
+
+/// Toggle focus mode for `pane`'s tab: the active pane takes over almost the
+/// whole tab, the others collapse to a sliver at the edge. Pressing it again
+/// puts every divider back exactly where it was. No animation — GTK applies
+/// the new divider positions on the next frame.
+///
+/// A tab with a single pane has nothing to zoom, so this does nothing there.
+fn toggle_focus_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
+    let Some(tab) = tab_of_pane(state, pane) else {
+        return;
+    };
+    if tab.zoom.borrow().is_some() {
+        leave_focus_mode(&tab);
+    } else {
+        enter_focus_mode(&tab, pane);
+    }
+}
+
+/// Squeeze every pane except `pane` by pushing the divider of each `GtkPaned`
+/// on the path from `pane` to the tab root all the way to the far side.
+///
+/// Nothing is reparented: moving a `GLArea` between containers destroys and
+/// recreates its GL context (see the hard-won-lessons section in CLAUDE.md),
+/// which would mean rebuilding the glyph atlas on every toggle. Divider moves
+/// are pure layout, so the toggle is instant and the renderers are untouched.
+fn enter_focus_mode(tab: &Rc<Tab>, pane: &Rc<Pane>) {
+    if tab.panes.borrow().len() < 2 {
+        return;
+    }
+
+    // Freeze the panes about to be squeezed *before* touching any divider, so
+    // the allocation change can't reach `reflow_to_pixels` with a sliver width.
+    for p in tab.panes.borrow().iter() {
+        if !Rc::ptr_eq(p, pane) {
+            freeze_reflow(p, true);
+        }
+    }
+
+    let mut saved: Vec<PanedSave> = Vec::new();
+    let mut node: gtk4::Widget = pane.wrap.clone().upcast();
+    // Walk up until the tab's container `Box` — the first non-Paned ancestor.
+    while let Some(parent) = node.parent() {
+        let Ok(paned) = parent.clone().downcast::<Paned>() else {
+            break;
+        };
+        let in_start = paned
+            .start_child()
+            .map(|c| c == node)
+            .unwrap_or(false);
+        let extent = paned_extent(&paned);
+        saved.push(PanedSave {
+            paned: paned.clone(),
+            position: paned.position(),
+            extent,
+        });
+        // Give our side FOCUS_PERCENT of the travel. GtkPaned still clamps to
+        // the squeezed child's minimum size, so the sliver may end up a little
+        // wider than asked — never narrower.
+        if extent > 0 {
+            let share = extent * FOCUS_PERCENT / 100;
+            paned.set_position(if in_start { share } else { extent - share });
+        }
+        node = paned.upcast();
+    }
+
+    if saved.is_empty() {
+        // Single pane in the tree after all (shouldn't happen given the length
+        // check above) — undo the freeze rather than leave it stuck.
+        for p in tab.panes.borrow().iter() {
+            freeze_reflow(p, false);
+        }
+        return;
+    }
+
+    log::info!("focus mode on ({} dividers)", saved.len());
+    *tab.zoom.borrow_mut() = Some(PaneZoom {
+        pane: pane.clone(),
+        saved,
+    });
+    for p in tab.panes.borrow().iter() {
+        p.gl_area.queue_render();
+    }
+}
+
+/// Put the dividers back and unfreeze the squeezed panes. No-op when the tab
+/// isn't in focus mode, so it's safe to call from anywhere that reshapes the
+/// pane tree.
+fn leave_focus_mode(tab: &Rc<Tab>) {
+    let Some(zoom) = tab.zoom.borrow_mut().take() else {
+        return;
+    };
+    // Outermost divider first: restoring from the top down means each inner
+    // Paned is already inside its final allocation when its own position is
+    // applied, so no position gets clamped against a stale extent.
+    for s in zoom.saved.iter().rev() {
+        let now = paned_extent(&s.paned);
+        // Scale if the Paned changed size while focus mode was on (window
+        // maximized, resized, HiDPI change); otherwise this is s.position.
+        let position = if s.extent > 0 && now > 0 && now != s.extent {
+            ((s.position as i64 * now as i64) / s.extent as i64) as i32
+        } else {
+            s.position
+        };
+        s.paned.set_position(position);
+    }
+    // Unfreeze after the positions are back. The pending allocation change will
+    // fire `connect_resize` → `schedule_reflow`, and since these grids never
+    // changed size, `reflow_to_pixels` sees the original dimensions and returns
+    // without touching the grid or the PTY.
+    for p in tab.panes.borrow().iter() {
+        freeze_reflow(p, false);
+        p.gl_area.queue_render();
+    }
+    log::info!("focus mode off");
+}
+
+/// Set (or clear) a pane's reflow freeze. Freezing also drops any reflow that
+/// was already armed, which would otherwise fire against the squeezed size.
+fn freeze_reflow(pane: &Rc<Pane>, frozen: bool) {
+    pane.reflow_frozen.set(frozen);
+    if frozen {
+        if let Some(id) = pane.resize_source.borrow_mut().take() {
+            id.remove();
+        }
+    }
+}
+
+/// End focus mode in whichever tab owns `pane`. Called before anything that
+/// reshapes the pane tree — the saved dividers would be stale (or destroyed)
+/// afterwards, and [`PaneZoom`] holds an `Rc` that would keep a closed pane's
+/// PTY alive.
+fn leave_focus_mode_of(state: &Rc<WindowState>, pane: &Rc<Pane>) {
+    if let Some(tab) = tab_of_pane(state, pane) {
+        leave_focus_mode(&tab);
+    }
+}
+
 /// Replace the focused pane's wrapper with a `GtkPaned` containing the old
 /// pane + a freshly-spawned new pane, oriented per `dir`. The new pane takes
 /// focus so chord chains continue against it.
 fn split(state: &Rc<WindowState>, focused: &Rc<Pane>, dir: SplitDir) -> Option<Rc<Pane>> {
+    // Splitting inside a zoomed layout would put the new pane inside the
+    // enlarged region and leave the saved dividers describing a tree that no
+    // longer matches.
+    leave_focus_mode_of(state, focused);
     let old_wrap = focused.wrap.clone();
     let Some(parent) = old_wrap.parent() else {
         log::warn!("split: focused pane has no parent");
@@ -2956,6 +3185,9 @@ fn rearrange_pane(state: &Rc<WindowState>, src: &Rc<Pane>, dst: &Rc<Pane>, dir: 
     if Rc::ptr_eq(src, dst) {
         return;
     }
+    // Both tabs get reshaped by the move; saved dividers wouldn't survive it.
+    leave_focus_mode_of(state, src);
+    leave_focus_mode_of(state, dst);
     let Some(src_tab) = tab_of_pane(state, src) else { return };
     let Some(dst_tab) = tab_of_pane(state, dst) else { return };
 
@@ -3027,6 +3259,9 @@ fn update_all_pane_toolbars(state: &Rc<WindowState>) {
 /// so its PTY/child go with the last `Rc`, and move focus to a remaining
 /// pane. Closing the last pane is a no-op — the window stays open.
 fn close_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
+    // The tree is about to change shape, and a zoom record would both describe
+    // dividers that are gone and keep this pane's PTY alive through its `Rc`.
+    leave_focus_mode_of(state, pane);
     let wrap = pane.wrap.clone();
     let Some(parent) = wrap.parent() else {
         return;
@@ -3322,6 +3557,56 @@ fn unconstrain_scrolled_windows(widget: &gtk4::Widget) {
 /// stamp a color class (see the `menu-tab` / `menu-window` rules in
 /// `CSS_DARK_MENU`). The accelerator labels carry different text and are left
 /// untouched. Idempotent — re-run safely on every `show`.
+/// Every action that has a right-click menu item. Used to decide whether GTK's
+/// accelerator hints in that menu are worth showing at all.
+const MENU_ACTIONS: &[Action] = &[
+    Action::SplitDown,
+    Action::SplitRight,
+    Action::FocusPane,
+    Action::NewTab,
+    Action::NewWindow,
+    Action::MaximizeWindow,
+    Action::MinimizeWindow,
+    Action::Copy,
+    Action::Paste,
+    Action::SelectAll,
+    Action::ShowShortcuts,
+    Action::ClosePane,
+];
+
+/// Should the menu show the grey accelerator hints GTK renders next to items?
+///
+/// Only when *every* keybound item can show one. GTK can't render a two-key
+/// chord, so under the default skyterm style the hint appears beside New Window
+/// / Copy / Paste / Select All and nowhere else — which reads as if splitting,
+/// Focus Pane and Close have no shortcut at all. Under a chord-free style
+/// (Terminator, or a Custom set without prefix bindings) every item can show
+/// its combo, and then the hints are worth having.
+fn menu_accels_useful(state: &Rc<WindowState>) -> bool {
+    let km = state.keymap.borrow();
+    !MENU_ACTIONS
+        .iter()
+        .any(|a| km.bindings(*a).iter().any(|b| b.prefix))
+}
+
+/// Hide the accelerator labels GTK stamps into the menu's items. Inside a
+/// `GtkModelButton` the accel is a `GtkLabel` whose CSS node is named
+/// `accelerator` (that's what the `popover.skyterm-menu modelbutton accelerator`
+/// rules in `CSS_DARK_MENU` target). Hiding the widget rather than dimming it
+/// with CSS also gives back the width it reserved, so the menu shrinks to fit
+/// its labels. The accelerators themselves keep working — they're registered on
+/// the `Application` by `apply_accelerators`; this only removes the hint text.
+fn hide_menu_accels(widget: &gtk4::Widget) {
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if c.css_name() == "accelerator" {
+            c.set_visible(false);
+        }
+        hide_menu_accels(&c);
+        child = c.next_sibling();
+    }
+}
+
 fn colorize_menu_items(widget: &gtk4::Widget) {
     if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
         let text = label.text();
@@ -3817,6 +4102,13 @@ fn save_config(state: &Rc<WindowState>) {
         confirm_window_close: Some(state.confirm_window_close.get()),
         show_pane_toolbar: Some(state.show_pane_toolbar.get()),
         default_layout: Some(state.default_layout.borrow().clone()),
+        shortcut_style: Some(state.keymap.borrow().style().id().to_string()),
+        // Only written once the user has actually recorded something, so a
+        // config file from someone who never touched Custom stays clean.
+        keybindings: {
+            let custom = state.custom_keys.borrow();
+            (!custom.is_empty()).then(|| custom.clone())
+        },
     };
     if let Err(e) = cfg.save(&path) {
         log::warn!("save config: {e}");
@@ -4280,30 +4572,8 @@ fn open_settings(state: &Rc<WindowState>) {
     notebook.append_page(&behavior, Some(&Label::new(Some("Behavior"))));
 
     // ── Keybindings ──────────────────────────────────────────────────
-    let kb_list = ListBox::new();
-    kb_list.set_selection_mode(gtk4::SelectionMode::None);
-    for (combo, action) in keybinding_reference() {
-        let row = gtk4::Box::new(Orientation::Horizontal, 16);
-        row.set_margin_start(16);
-        row.set_margin_end(16);
-        row.set_margin_top(6);
-        row.set_margin_bottom(6);
-        let key = Label::builder()
-            .label(combo)
-            .xalign(0.0)
-            .width_chars(22)
-            .build();
-        key.add_css_class("monospace");
-        let act = Label::builder().label(action).xalign(0.0).hexpand(true).build();
-        row.append(&key);
-        row.append(&act);
-        kb_list.append(&row);
-    }
-    let kb_scroll = ScrolledWindow::new();
-    kb_scroll.set_child(Some(&kb_list));
-    kb_scroll.set_hexpand(true);
-    kb_scroll.set_vexpand(true);
-    notebook.append_page(&kb_scroll, Some(&Label::new(Some("Keybindings"))));
+    let kb_page = build_keybindings_page(state, &dialog, true);
+    notebook.append_page(&kb_page, Some(&Label::new(Some("Keybindings"))));
 
     outer.append(&notebook);
 
@@ -4326,43 +4596,446 @@ fn open_settings(state: &Rc<WindowState>) {
     dialog.present();
 }
 
-fn keybinding_reference() -> Vec<(&'static str, &'static str)> {
-    vec![
-        // Splits, tabs, close — the menu accelerators registered via
-        // `install_accelerators`. Listed first since these are the chords
-        // users picking up from Terminator will reach for.
-        ("Ctrl + Shift + O", "Split horizontally (new pane below)"),
-        ("Ctrl + Shift + E", "Split vertically (new pane to the right)"),
-        ("Ctrl + Shift + T", "Open a new tab"),
-        ("Ctrl + Shift + N", "Open a new window"),
-        ("Ctrl + Tab", "Next tab (also Ctrl + Page Down)"),
-        ("Ctrl + Shift + Tab", "Previous tab (also Ctrl + Page Up)"),
-        ("Ctrl + A + T", "Open a new tab (alternate shortcut)"),
-        ("Ctrl + A + N", "Open a new window (alternate shortcut)"),
-        ("Ctrl + Shift + W", "Close the focused pane"),
-        // Chord (tmux-style prefix) — alternate keybindings for the same
-        // operations plus extras (focus movement, literal Ctrl+A pass-through).
-        ("Ctrl + A + ←/↑/↓/→", "Split in that direction"),
-        ("Ctrl + A + O", "Cycle focus to the next pane"),
-        ("Ctrl + A + h/j/k/l", "Focus pane left / down / up / right"),
-        ("Ctrl + A + ' / /", "Previous / next theme (focused pane)"),
-        ("Ctrl + A + Ctrl+A", "Send literal Ctrl+A to the shell"),
-        // Clipboard.
-        ("Ctrl + Shift + C", "Copy selection"),
-        ("Ctrl + Shift + V", "Paste from system clipboard"),
-        ("Ctrl + Shift + A", "Select all (focused pane)"),
-        ("Middle-click", "Paste primary selection"),
-        ("Left-drag", "Select text"),
-        ("Double-click / triple-click", "Select word / line"),
-        // Zoom.
-        ("Ctrl + + / =", "Zoom in (focused pane)"),
-        ("Ctrl + -", "Zoom out (focused pane)"),
-        ("Ctrl + 0", "Reset font size (focused pane)"),
-        ("Ctrl + Scroll", "Zoom focused pane"),
-        // Misc.
-        ("Right-click", "Open the context menu"),
-        ("Toolbar ⋯ drag", "Rearrange pane (drop on an edge of another pane)"),
-    ]
+/// The shortcut list: a search box (plus, optionally, the Shortcut Style
+/// selector) over a live view of the active keymap. Shared by the Settings
+/// notebook's Keybindings tab and the standalone reference window opened with
+/// `Ctrl+A + Backspace`, so the two can't drift apart.
+///
+/// `parent` is the window the binding-capture dialog should be modal to.
+fn build_keybindings_page(
+    state: &Rc<WindowState>,
+    parent: &gtk4::Window,
+    with_style_selector: bool,
+) -> gtk4::Box {
+    use gtk4::{DropDown, Label, ListBox, ScrolledWindow, StringList};
+
+    let page = gtk4::Box::new(Orientation::Vertical, 0);
+
+    let header = gtk4::Box::new(Orientation::Horizontal, 10);
+    header.set_margin_start(16);
+    header.set_margin_end(16);
+    header.set_margin_top(12);
+    header.set_margin_bottom(10);
+
+    let search = Entry::new();
+    search.set_placeholder_text(Some("Search shortcuts…"));
+    search.set_hexpand(true);
+    search.set_primary_icon_name(Some("system-search-symbolic"));
+    header.append(&search);
+
+    let list = ListBox::new();
+    list.set_selection_mode(gtk4::SelectionMode::None);
+
+    if with_style_selector {
+        let style_label = Label::builder().label("Shortcut Style").build();
+        let style_names: Vec<&str> = ShortcutStyle::ALL.iter().map(|s| s.label()).collect();
+        let style_dd =
+            DropDown::new(Some(StringList::new(&style_names)), gtk4::Expression::NONE);
+        {
+            let current = state.keymap.borrow().style();
+            if let Some(idx) = ShortcutStyle::ALL.iter().position(|s| *s == current) {
+                style_dd.set_selected(idx as u32);
+            }
+        }
+        {
+            let state = state.clone();
+            let list = list.clone();
+            let parent = parent.clone();
+            let search = search.clone();
+            style_dd.connect_selected_notify(move |dd| {
+                let Some(style) = ShortcutStyle::ALL.get(dd.selected() as usize).copied() else {
+                    return;
+                };
+                if state.keymap.borrow().style() == style {
+                    return;
+                }
+                // Switching to Custom with nothing recorded yet seeds the table
+                // from the set the user was just using, so they edit from a
+                // familiar starting point instead of an empty list.
+                if style == ShortcutStyle::Custom && state.custom_keys.borrow().is_empty() {
+                    let snapshot = state.keymap.borrow().snapshot();
+                    *state.custom_keys.borrow_mut() = snapshot;
+                }
+                apply_shortcut_style(&state, style);
+                save_config(&state);
+                populate_keybindings(&list, &state, &parent, &search);
+            });
+        }
+        header.append(&style_label);
+        header.append(&style_dd);
+    }
+    page.append(&header);
+
+    let scroll = ScrolledWindow::new();
+    scroll.set_child(Some(&list));
+    scroll.set_hexpand(true);
+    scroll.set_vexpand(true);
+    page.append(&scroll);
+
+    populate_keybindings(&list, state, parent, &search);
+    {
+        let state = state.clone();
+        let list = list.clone();
+        let parent = parent.clone();
+        search.connect_changed(move |entry| {
+            populate_keybindings(&list, &state, &parent, entry);
+        });
+    }
+    page
+}
+
+/// Standalone shortcut reference (`Ctrl+A + Backspace`, menu "Shortcuts…") —
+/// the same searchable list as Settings ▸ Keybindings without the rest of the
+/// Settings chrome. Not modal: it's meant to sit open beside the terminal while
+/// you work. Escape closes it.
+fn open_shortcuts(state: &Rc<WindowState>) {
+    use gtk4::{Align, Button, Label};
+
+    let dialog = gtk4::Window::new();
+    dialog.set_title(Some("skyterm Shortcuts"));
+    dialog.set_transient_for(Some(&state.window));
+    dialog.set_default_size(620, 560);
+
+    let outer = gtk4::Box::new(Orientation::Vertical, 0);
+    outer.append(&build_keybindings_page(state, &dialog, false));
+
+    let footer = gtk4::Box::new(Orientation::Horizontal, 8);
+    footer.set_halign(Align::End);
+    footer.set_margin_top(8);
+    footer.set_margin_bottom(10);
+    footer.set_margin_start(10);
+    footer.set_margin_end(10);
+    let hint = Label::builder()
+        .label("Change these in Settings ▸ Keybindings")
+        .hexpand(true)
+        .xalign(0.0)
+        .build();
+    hint.add_css_class("dim-label");
+    let close = Button::with_label("Close");
+    {
+        let dialog = dialog.clone();
+        close.connect_clicked(move |_| dialog.close());
+    }
+    footer.append(&hint);
+    footer.append(&close);
+    outer.append(&footer);
+
+    // Escape closes — this is a reference popup, not a form.
+    {
+        let dialog_w = dialog.clone();
+        let keys = EventControllerKey::new();
+        keys.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gdk::Key::Escape {
+                dialog_w.close();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        dialog.add_controller(keys);
+    }
+
+    dialog.set_child(Some(&outer));
+    dialog.present();
+}
+
+/// Does `haystack` contain every whitespace-separated term in `needle`?
+/// Case-insensitive, substring per term — so "split h" finds "Split pane
+/// horizontally" and a partial word like "spl" matches on the first keystroke.
+fn matches_search(haystack: &str, needle: &str) -> bool {
+    let hay = haystack.to_lowercase();
+    needle
+        .to_lowercase()
+        .split_whitespace()
+        .all(|term| hay.contains(term))
+}
+
+/// (Re)build the Settings ▸ Keybindings list from the active keymap, filtered
+/// by whatever is typed in `search`. Under the `Custom` style each combo is a
+/// button that records a replacement; under the built-in styles the combos are
+/// read-only labels.
+fn populate_keybindings(
+    list: &gtk4::ListBox,
+    state: &Rc<WindowState>,
+    dialog: &gtk4::Window,
+    search: &Entry,
+) {
+    use gtk4::{Button, Label};
+
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+
+    let filter = search.text().to_string();
+    let editable = state.keymap.borrow().style() == ShortcutStyle::Custom;
+    let mut shown = 0usize;
+
+    // One row: combo column (label or record-button) + description.
+    for action in Action::all().iter().copied() {
+        let combos: Vec<String> = state
+            .keymap
+            .borrow()
+            .bindings(action)
+            .iter()
+            .map(|b| b.display())
+            .collect();
+        let combo = if combos.is_empty() {
+            "—".to_string()
+        } else {
+            combos.join("   or   ")
+        };
+        if !matches_search(&format!("{combo} {}", action.label()), &filter) {
+            continue;
+        }
+        shown += 1;
+
+        let row = gtk4::Box::new(Orientation::Horizontal, 16);
+        row.set_margin_start(16);
+        row.set_margin_end(16);
+        row.set_margin_top(4);
+        row.set_margin_bottom(4);
+
+        if editable {
+            let btn = Button::with_label(&combo);
+            btn.set_size_request(220, -1);
+            btn.set_tooltip_text(Some("Click, then press the new key combination"));
+            {
+                let state = state.clone();
+                let dialog = dialog.clone();
+                let list = list.clone();
+                let search = search.clone();
+                btn.connect_clicked(move |_| {
+                    let state2 = state.clone();
+                    let list = list.clone();
+                    let search = search.clone();
+                    let dialog2 = dialog.clone();
+                    capture_binding(&dialog, action, move |binding| {
+                        set_custom_binding(&state2, action, Some(binding));
+                        populate_keybindings(&list, &state2, &dialog2, &search);
+                    });
+                });
+            }
+            row.append(&btn);
+
+            let clear = Button::with_label("✕");
+            clear.set_tooltip_text(Some("Unbind"));
+            clear.add_css_class("flat");
+            clear.set_sensitive(!combos.is_empty());
+            {
+                let state = state.clone();
+                let dialog = dialog.clone();
+                let list = list.clone();
+                let search = search.clone();
+                clear.connect_clicked(move |_| {
+                    set_custom_binding(&state, action, None);
+                    populate_keybindings(&list, &state, &dialog, &search);
+                });
+            }
+            row.append(&clear);
+        } else {
+            let key = Label::builder()
+                .label(&combo)
+                .xalign(0.0)
+                .width_chars(24)
+                .build();
+            key.add_css_class("monospace");
+            row.append(&key);
+        }
+
+        let act = Label::builder()
+            .label(action.label())
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        row.append(&act);
+        list.append(&row);
+    }
+
+    // Mouse gestures — not rebindable, listed so this tab is a complete
+    // reference for "how do I do X".
+    let mouse: Vec<&(&str, &str)> = keymap::MOUSE_REFERENCE
+        .iter()
+        .filter(|(combo, desc)| matches_search(&format!("{combo} {desc}"), &filter))
+        .collect();
+    if !mouse.is_empty() {
+        let header = Label::builder()
+            .label("Mouse")
+            .xalign(0.0)
+            .margin_start(16)
+            .margin_top(12)
+            .margin_bottom(2)
+            .build();
+        header.add_css_class("heading");
+        list.append(&header);
+        for (combo, desc) in mouse {
+            shown += 1;
+            let row = gtk4::Box::new(Orientation::Horizontal, 16);
+            row.set_margin_start(16);
+            row.set_margin_end(16);
+            row.set_margin_top(4);
+            row.set_margin_bottom(4);
+            let key = Label::builder()
+                .label(*combo)
+                .xalign(0.0)
+                .width_chars(24)
+                .build();
+            key.add_css_class("monospace");
+            let act = Label::builder().label(*desc).xalign(0.0).hexpand(true).build();
+            row.append(&key);
+            row.append(&act);
+            list.append(&row);
+        }
+    }
+
+    if shown == 0 {
+        let empty = Label::builder()
+            .label(format!("No shortcuts match “{filter}”"))
+            .xalign(0.0)
+            .margin_start(16)
+            .margin_top(16)
+            .build();
+        empty.add_css_class("dim-label");
+        list.append(&empty);
+    }
+}
+
+/// Record `binding` (or `None` to unbind) for `action` in the user's custom
+/// table, drop the same combo from any other action so two actions can't fight
+/// over one key, then rebuild the keymap, re-install accelerators and save.
+///
+/// The table is seeded with every action when the user switches to Custom, so
+/// stripping duplicates here sees the complete picture.
+fn set_custom_binding(state: &Rc<WindowState>, action: Action, binding: Option<Binding>) {
+    {
+        let mut custom = state.custom_keys.borrow_mut();
+        if custom.is_empty() {
+            // Defensive: Settings seeds on style switch, but a hand-written
+            // config could be missing the table entirely.
+            *custom = state.keymap.borrow().snapshot();
+        }
+        if let Some(b) = &binding {
+            let spec = b.spec();
+            for (id, specs) in custom.iter_mut() {
+                if id == action.id() {
+                    continue;
+                }
+                let kept: Vec<&str> = specs
+                    .split(',')
+                    .filter(|s| !s.trim().is_empty() && s.trim() != spec)
+                    .collect();
+                let kept = kept.join(",");
+                if kept != *specs {
+                    log::info!("keybinding: {spec} taken from {id} by {}", action.id());
+                    *specs = kept;
+                }
+            }
+        }
+        custom.insert(
+            action.id().to_string(),
+            binding.map(|b| b.spec()).unwrap_or_default(),
+        );
+    }
+    apply_shortcut_style(state, ShortcutStyle::Custom);
+    save_config(state);
+}
+
+/// Modal "press a key combination" recorder. Calls `on_done` with the recorded
+/// binding; cancelling (Escape or closing the window) never calls it.
+///
+/// Pressing the chord prefix (`Ctrl+A`, `⌘A` on macOS) first arms it and waits
+/// for a second key, so a prefix binding is recorded by typing it exactly the
+/// way it will be used.
+fn capture_binding<F>(parent: &gtk4::Window, action: Action, on_done: F)
+where
+    F: Fn(Binding) + 'static,
+{
+    use gtk4::{Align, Label};
+
+    let win = gtk4::Window::new();
+    win.set_title(Some("Set shortcut"));
+    win.set_transient_for(Some(parent));
+    win.set_modal(true);
+    win.set_resizable(false);
+    win.set_default_size(400, -1);
+
+    let vbox = gtk4::Box::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(24);
+    vbox.set_margin_bottom(24);
+    vbox.set_margin_start(24);
+    vbox.set_margin_end(24);
+
+    let what = Label::new(Some(action.label()));
+    what.add_css_class("heading");
+    what.set_halign(Align::Center);
+
+    let prompt = Label::new(Some("Press the new key combination…"));
+    prompt.set_halign(Align::Center);
+    prompt.add_css_class("title-2");
+
+    let hint = Label::new(Some(
+        "Needs Ctrl, Alt, or the Ctrl+A prefix.  Esc to cancel.",
+    ));
+    hint.add_css_class("dim-label");
+    hint.set_halign(Align::Center);
+    hint.set_wrap(true);
+
+    vbox.append(&what);
+    vbox.append(&prompt);
+    vbox.append(&hint);
+    win.set_child(Some(&vbox));
+
+    // Whether the chord prefix has been pressed and we're waiting for the
+    // second key of the combo.
+    let prefixed = Rc::new(Cell::new(false));
+    let keys = EventControllerKey::new();
+    {
+        let win = win.clone();
+        let prompt = prompt.clone();
+        let hint = hint.clone();
+        let prefixed = prefixed.clone();
+        keys.connect_key_pressed(move |_, keyval, _, modifiers| {
+            if is_modifier_only(keyval) {
+                return glib::Propagation::Stop;
+            }
+            if keyval == gdk::Key::Escape {
+                win.close();
+                return glib::Propagation::Stop;
+            }
+            // Stage one: the chord prefix itself.
+            let chord_mod = if cfg!(target_os = "macos") {
+                gdk::ModifierType::META_MASK
+            } else {
+                gdk::ModifierType::CONTROL_MASK
+            };
+            if !prefixed.get()
+                && modifiers.contains(chord_mod)
+                && matches!(keyval, gdk::Key::a | gdk::Key::A)
+            {
+                prefixed.set(true);
+                prompt.set_label(&format!(
+                    "{} + A + …",
+                    if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" }
+                ));
+                return glib::Propagation::Stop;
+            }
+            let Some(binding) = keymap::binding_from_event(prefixed.get(), modifiers, keyval)
+            else {
+                hint.set_label("That key can't be bound — try another.");
+                return glib::Propagation::Stop;
+            };
+            if !binding.is_safe() {
+                hint.set_label(
+                    "That combo would shadow ordinary typing. \
+                     Add Ctrl or Alt, or start with the Ctrl+A prefix.",
+                );
+                return glib::Propagation::Stop;
+            }
+            on_done(binding);
+            win.close();
+            glib::Propagation::Stop
+        });
+    }
+    win.add_controller(keys);
+    win.present();
 }
 
 fn paste(pane: &Rc<Pane>, primary: bool) {

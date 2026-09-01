@@ -1,6 +1,7 @@
 mod app;
 mod font;
 mod input;
+mod keymap;
 mod pty;
 mod renderer;
 
