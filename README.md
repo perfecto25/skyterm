@@ -636,18 +636,18 @@ To re-run a release for an existing tag
 
 - add Focus Pane option
   
-  - Control + A + F (makes current pane take up 90% of screen size) - similar to Waveterm Focus feature (done)
-  - also on the right click Menu, and rebindable under Settings > Keybindings (done)
+  - Control + A + F (makes current pane take up 90% of screen size) - similar to Waveterm Focus feature
+  - also on the right click Menu, and rebindable under Settings > Keybindings
 
 - update keybindings:
   
-  - add shortcut search under Settings > Keybindings (done)
-  - split shortcuts by Style ie, Skyterm style, Terminator style, Custom style (done)
-  - Menu shortcuts helpers should be dynamic - based on selected shortcut style (done) - the grey hints only show when every menu item can show one, so they are hidden under Skyterm style (Ctrl+A chords cant be drawn as an accelerator) and shown under Terminator style
-  - add Maximize/Minimize terminal shortcut - Control + A + ] and Control + A + [ , also on the right click Menu (done)
-  - add Control + A + Backspace to open up direct Keyboard shortcut lookup window (done) - also on the right click Menu > Shortcuts…
-  - move Copy / Paste / Select All onto the prefix - Control + A + C / V / A (done)
-  - add Control + A + Enter to open the right click Menu from the keyboard (done)
+  - add shortcut search under Settings > Keybindings
+  - split shortcuts by Style ie, Skyterm style, Terminator style, Custom style
+  - Menu shortcuts helpers should be dynamic - based on selected shortcut style - the grey hints only show when every menu item can show one, so they are hidden under Skyterm style (Ctrl+A chords cant be drawn as an accelerator) and shown under Terminator style
+  - add Maximize/Minimize terminal shortcut - Control + A + ] and Control + A + [ , also on the right click Menu 
+  - add Control + A + Backspace to open up direct Keyboard shortcut lookup window - also on the right click Menu > Shortcuts…
+  - move Copy / Paste / Select All onto the prefix - Control + A + C / V / A 
+  - add Control + A + Enter to open the right click Menu from the keyboard 
 
 - Builds:
 
