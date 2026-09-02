@@ -928,3 +928,37 @@ mod tests {
         }
     }
 }
+
+/// Documentation helper, not a test of behaviour.
+///
+/// The README carries a full table of both built-in shortcut sets, and it has
+/// drifted from the code more than once. Regenerate it with:
+///
+/// ```text
+/// cargo test -p skyterm-gui docgen -- --ignored --nocapture
+/// ```
+///
+/// and paste the rows into the "All Skyterm shortcuts" / "All Terminator
+/// shortcuts" tables. `#[ignore]` so it stays out of ordinary test runs.
+#[cfg(test)]
+mod docgen {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn print_readme_tables() {
+        for style in [ShortcutStyle::Skyterm, ShortcutStyle::Terminator] {
+            println!("\n===== {} =====", style.label());
+            let km = Keymap::new(style, &BTreeMap::new());
+            for a in Action::all() {
+                let combos: Vec<String> =
+                    km.bindings(*a).iter().map(|b| b.display()).collect();
+                if combos.is_empty() {
+                    println!("UNBOUND: {}", a.label());
+                } else {
+                    println!("| `{}` | {} |", combos.join("` / `"), a.label());
+                }
+            }
+        }
+    }
+}

@@ -46,7 +46,7 @@ What's working end-to-end today:
 - **Copy-on-select.** When `copy_on_select` is on, the `GestureDrag` `connect_end` handler copies the current selection (word, line, or drag) to the clipboard on button release. Default off.
 - **Snap-to-bottom on type.** Typing or pasting while scrolled up snaps the view back to the live screen before bytes reach the PTY.
 
-~39 grid/parser unit tests live in `skyterm-core` (reflow, mouse modes, DECCKM, scroll region, IL/DL, SGR, alt screen, scrollback, DEC graphics).
+62 tests: 46 in `skyterm-core` (grid/parser — reflow, mouse modes, DECCKM, scroll region, IL/DL, SGR, alt screen, scrollback, DEC graphics — plus config TOML round-trip) and 16 in `skyterm-gui` (keymap: binding parse/display round-trip, per-style default sanity, no-duplicate-combo guard, chord resolution incl. the Ctrl two-pass pair, custom-override layering; font atlas).
 
 ## Stack — actual deps in use
 
@@ -73,6 +73,7 @@ skyterm/
 ├── package-rpm.sh             # build release + cargo-generate-rpm  → .rpm
 ├── package-deb.sh             # build release + cargo-deb           → .deb
 ├── package-macos.sh           # .app bundle + dylibbundler + create-dmg (run on macOS)
+├── PKGBUILD                   # Arch package: `makepkg -f`             → .pkg.tar.zst
 ├── skyterm-core/              # headless: parser + grid + theme model
 │   ├── src/
 │   │   ├── grid.rs            # cells, scrollback, scroll region, Row{wrapped}+reflow, mouse/DECCKM flags
@@ -91,10 +92,15 @@ skyterm/
 │   │   ├── keymap.rs          # Action registry, shortcut styles, binding parse/display
 │   │   └── pty.rs             # portable-pty + reader thread + async_channel
 │   └── resources/             # skyterm.svg icon, skyterm.desktop, JetBrainsMono-Regular.ttf (embedded fallback font)
-└── docs/                      # config schema, keybindings, theme guide
+└── .github/workflows/
+    └── release.yml            # tag vX.Y.Z → .deb/.rpm (x86_64 + aarch64), .pkg.tar.zst, .dmg
 ```
 
+There is no `docs/` directory: the README is the user-facing documentation (install, every shortcut for both styles, config schema, themes, releases) and this file is the internal one. The README's two shortcut tables are generated — `cargo test -p skyterm-gui docgen -- --ignored --nocapture` prints them from the keymap; regenerate and paste rather than hand-editing, they have drifted before.
+
 Packaging metadata for `cargo-generate-rpm` and `cargo-deb` lives in `[package.metadata.*]` in `skyterm-gui/Cargo.toml`. Asset paths there are relative to `skyterm-gui/`, so the binary is `../target/release/skyterm`. The RPM/deb both install the binary, the SVG icon, and the `.desktop` launcher.
+
+The Arch package uses the root `PKGBUILD`, which builds the working tree in place (no `source=()` tarball) so the same file serves `makepkg -f` locally and the release pipeline. It derives `pkgver` from the workspace version in `Cargo.toml` via `BASH_SOURCE` — not `$startdir`, which isn't set yet while makepkg is sourcing the file — so releases never need a version bump here. `options=('!debug')` suppresses the near-empty `-debug` split package that would otherwise be uploaded alongside it. CI builds it in the official `archlinux:base-devel` container (`arch-linux` job in `release.yml`): the pacman step runs *before* `actions/checkout` because the image ships no git, and makepkg runs as a created `builder` user since it refuses to run as root.
 
 `skyterm-core` has zero GTK/GL dependencies. `skyterm-gui` depends on `skyterm-core`.
 
@@ -102,8 +108,8 @@ Packaging metadata for `cargo-generate-rpm` and `cargo-deb` lives in `[package.m
 
 1. **M1 — Hello PTY.** ✅ Done.
 2. **M2 — Real text rendering.** ⚠️ Mostly done. Truecolor + 256-color, cursor styles (underline-only for now), bracketed paste, DEC charset, scroll region, IL/DL, mouse reporting (?1000/1002/1003 + ?1006 SGR; wheel + button clicks/drags forwarded — Shift overrides to local selection), application cursor keys (DECCKM ?1) all working. **Still missing:** HarfBuzz shaping → ligatures, italic/underline SGR attrs, vttest sweep.
-3. **M3 — Splits, tabs, shortcuts, menu.** ✅ Done. Splits (Ctrl+A chord), tabs (GtkNotebook + new-tab menu action), right-click menu (splits + Copy/Paste/Select All + Settings/About + red Close), drag-select + copy, click-to-focus, per-pane font zoom. Full keybinding registry (`keymap.rs`) with searchable + user-editable Settings tab and switchable Skyterm / Terminator / Custom styles.
-4. **M4 — Config & themes.** 🔄 Substantially done. `Config` loads at startup and saves from Settings (font family/size, theme, scrollback, cursor blink); built-in themes + user themes (`load_user_themes`); live apply across panes. **Still missing:** opacity, cursor-style selection in UI, broader config surface.
+3. **M3 — Splits, tabs, shortcuts, menu.** ✅ Done. Splits (Ctrl+A chord), tabs (GtkNotebook + preset layouts + rename + drag-reorder), right-click menu (splits + Focus Pane + Maximize/Minimize + clipboard + Themes/Shortcuts/Settings/About + red Close), drag-select + copy, click-to-focus, per-pane font zoom, pane drag-and-drop between positions and tabs, focus mode. Full keybinding registry (`keymap.rs`) with searchable + user-editable Settings tab, a standalone shortcut reference window, and switchable Skyterm / Terminator / Custom styles.
+4. **M4 — Config & themes.** 🔄 Substantially done. `Config` loads at startup and saves from Settings (font family/size, theme, scrollback, cursor blink, selection behaviour, tab/pane/window close confirmations, tab limit, pane toolbar, default layout, shortcut style + custom keybindings); built-in themes + user themes (`load_user_themes`); live apply across panes. **Still missing:** opacity, cursor-style selection in UI.
 5. **M5 — URLs, search, sixel.** ❌ Not started.
 
 Shipping = M5 complete = v1.
@@ -166,9 +172,10 @@ Proven empirically: dump the popover's live node tree + `widget.color()` while i
 
 ## Verification
 
-- **Headless tests in `skyterm-core/tests/`** + inline `#[cfg(test)]` modules in `grid.rs` and `parser.rs`. ~39 tests covering reflow (widen/narrow/scrollback-boundary/alt-screen), mouse modes + SGR toggle, DECCKM, scroll region, IL/DL, SGR, cursor save/restore, alt screen, scrollback, DEC graphics.
+- **Headless tests in `skyterm-core/tests/`** + inline `#[cfg(test)]` modules in `grid.rs`, `parser.rs`, `config.rs` and `keymap.rs`. `cargo test` runs all 62; none need a display.
 - **End-to-end per milestone**: see "Done when" in each M.
-- **CI** (when set up): `cargo test -p skyterm-core` on Linux; `cargo build -p skyterm-gui` on Linux + macOS.
+- **GUI behaviour that tests can't reach** (focus mode geometry, window maximize/minimize, popover/menu internals) has been checked by temporarily instrumenting `on_activate` behind a `SKYTERM_DEBUG_*` env var, running the binary against the real display, and logging the state — e.g. dumping each pane's pixel + grid size before/after a focus toggle, or querying `_NET_WM_STATE` around a maximize. Cheaper and more conclusive than screenshots; delete the hook afterwards. To run a second instance while one is already open, unset the session bus (`DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent`) or GApplication's single-instance handling hands your launch to the running process and exits silently.
+- **CI**: `.github/workflows/release.yml` builds all release artifacts on tag push / manual dispatch. There is no separate test workflow — the Arch leg's `PKGBUILD` `check()` runs `cargo test -p skyterm-core`, which is the only automated test run today.
 
 ## Platform caveats
 

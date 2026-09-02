@@ -3,10 +3,11 @@ name: release
 # Build distributable binaries on the free tier (public repo → standard
 # GitHub-hosted runners are free, with no OS minute-multiplier).
 #
-#   * Linux x86_64  → .deb + .rpm   (ubuntu-24.04)
-#   * Linux aarch64 → .deb + .rpm   (ubuntu-24.04-arm)
-#   * macOS Intel   → .dmg          (macos-13)
-#   * macOS Apple   → .dmg          (macos-14)
+#   * Linux x86_64  → .deb + .rpm     (ubuntu-24.04)
+#   * Linux aarch64 → .deb + .rpm     (ubuntu-24.04-arm)
+#   * Arch x86_64   → .pkg.tar.zst    (archlinux container on ubuntu-24.04)
+#   * macOS Intel   → .dmg            (macos-13)
+#   * macOS Apple   → .dmg            (macos-14)
 #
 # Push a `vX.Y.Z` tag to build + publish a GitHub Release with all artifacts.
 
@@ -85,6 +86,48 @@ jobs:
             target/generate-rpm/*.rpm
           if-no-files-found: error
 
+  arch-linux:
+    name: arch-x86_64
+    runs-on: ubuntu-24.04
+    # Build inside the official Arch image: an Arch package has to be linked
+    # against Arch's own GTK4 / glibc, so it can't be produced on the Ubuntu
+    # runner. x86_64 only — Arch Linux ARM is a separate distribution and
+    # publishes no official container image.
+    container:
+      image: archlinux:base-devel
+    timeout-minutes: 45
+    steps:
+      # Before checkout: the image has no git, and actions/checkout would
+      # otherwise fall back to a REST tarball download.
+      - name: Install GTK4 + build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git rust gtk4 libepoxy freetype2 fontconfig pkgconf sudo
+
+      - uses: actions/checkout@v4
+
+      - name: Build package
+        # makepkg refuses to run as root, so hand the tree to an unprivileged
+        # user. --nodeps because pacman already installed everything above;
+        # PKGBUILD reads its pkgver straight from Cargo.toml.
+        run: |
+          useradd -m builder
+          printf 'builder ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/builder
+          chown -R builder:builder .
+          sudo -u builder makepkg -f --noconfirm --nodeps
+
+      - name: Show package contents
+        run: |
+          pkg=$(ls *.pkg.tar.zst | head -1)
+          echo "built $pkg"
+          bsdtar -tf "$pkg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-x86_64
+          path: "*.pkg.tar.zst"
+          if-no-files-found: error
+
   macos:
     name: macos-${{ matrix.arch }}
     strategy:
@@ -131,7 +174,7 @@ jobs:
 
   release:
     name: publish release
-    needs: [linux, macos]
+    needs: [linux, arch-linux, macos]
     runs-on: ubuntu-latest
     # Only publish a GitHub Release for tag pushes; workflow_dispatch runs just
     # build + upload artifacts so you can test the pipeline first.
@@ -152,5 +195,6 @@ jobs:
           files: |
             dist/debian/*.deb
             dist/generate-rpm/*.rpm
+            dist/*.pkg.tar.zst
             dist/*.dmg
           fail_on_unmatched_files: true

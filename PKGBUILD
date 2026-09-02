@@ -28,6 +28,9 @@ license=('MIT')
 # freetype and fontconfig directly, so they are named here.
 depends=('gtk4' 'libepoxy' 'freetype2' 'fontconfig')
 makedepends=('cargo' 'pkgconf')
+# No separate -debug package: the release profile carries no useful debug info,
+# so it comes out near-empty and would only clutter the release artifacts.
+options=('!debug')
 # The tree is built in place (no source array), so makepkg has nothing to
 # fetch or verify.
 source=()

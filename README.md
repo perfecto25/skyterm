@@ -34,11 +34,12 @@ Skyterm is written in Rust for performance, memory safety and availability of la
 
 Skyterm has the following features:
 
-- Tabs
-- Panes (ability to split a tab into multiple panes)
+- Tabs (renameable, draggable, with preset pane layouts)
+- Panes (ability to split a tab into multiple panes, drag them into new positions or into another tab)
+- Focus mode - enlarge the pane you are working in without losing the others
 - Infinite scrollback
 - built in Themes (future release will add Terminator-compatible theme files)
-- shortcut key bindings
+- shortcut key bindings - Skyterm or Terminator style, or record your own, with a searchable reference built in
 
 
 Skyterm aims to be basic, fast and no-nonsense terminal emulator tailored for system administrators, developers and anyone who wants a responsive and lightweight terminal that doesnt get in your way. 
@@ -47,7 +48,9 @@ Skyterm aims to be basic, fast and no-nonsense terminal emulator tailored for sy
 
 all Skyterm actions are available through a menu (right click to open menu) or through a keyboard shortcut.
 
-Every shortcut is listed in Menu > Settings > Keybindings, with a search box - type part of an action or a combo ("split", "tab", "ctrl") to filter the list.
+Every shortcut is listed in Menu > Settings > Keybindings, with a search box - type part of an action or a combo ("split", "tab", "ctrl") to filter the list. The same list is a keypress away at any time with `Ctrl+A → Backspace` (Menu > Shortcuts…).
+
+The menu shows its grey shortcut hints only when every item can show one. Under Skyterm style most shortcuts are two-key `Ctrl+A` chords, which GTK cannot draw as an accelerator, so the hints are hidden rather than shown for a random four items; under Terminator style they all appear.
 
 #### Shortcut Style
 
@@ -579,9 +582,52 @@ for DEB builds
     ./package-deb.sh
 
 
+for Arch Linux builds
+
+on Arch, the PKGBUILD in the repo root builds from the working tree
+
+    makepkg -f
+
+    Install:    sudo pacman -U skyterm-0.1.8-1-x86_64.pkg.tar.zst
+    Upgrade:    same command - pacman replaces the installed version
+    Verify:     pacman -Qip skyterm-0.1.8-1-x86_64.pkg.tar.zst
+
+the version comes from Cargo.toml, so there is nothing to bump in the PKGBUILD. On a non-Arch machine you can build the package in a container
+
+    podman run --rm -v "$PWD":/repo:ro,Z archlinux:base-devel bash -c '
+      pacman -Syu --noconfirm --needed git rust gtk4 libepoxy freetype2 fontconfig pkgconf sudo
+      useradd -m builder && cp -a /repo /build && chown -R builder:builder /build
+      cd /build && sudo -u builder makepkg -f --noconfirm --nodeps'
+
+
 for MacOS builds
 
     ./package-macos.sh
+
+
+### Releases
+
+Releases are built by `.github/workflows/release.yml` on GitHub's free runners. Push a version tag and every artifact is built and attached to a GitHub Release:
+
+    git tag -a v0.1.8 -m 'release 0.1.8'
+    git push origin --tags
+
+| Job | Runner | Artifact |
+| --- | --- | --- |
+| `linux-x86_64` | ubuntu-24.04 | `.deb` + `.rpm` |
+| `linux-aarch64` | ubuntu-24.04-arm | `.deb` + `.rpm` |
+| `arch-x86_64` | archlinux container on ubuntu-24.04 | `.pkg.tar.zst` |
+| `macos-arm64` | macos-14 | `.dmg` |
+
+skyterm links GTK4 dynamically, so every target is built natively rather than cross-compiled - that is also why the Arch package is built inside the official `archlinux:base-devel` container instead of on the Ubuntu runner.
+
+Run the workflow manually (Actions > release > Run workflow) to build and upload the artifacts without publishing a release - useful for testing the pipeline before cutting a tag.
+
+To re-run a release for an existing tag
+
+    git tag -d v0.1.8
+    git tag v0.1.8
+    git push --force origin v0.1.8
 
 
 ### Changelog
@@ -605,7 +651,7 @@ for MacOS builds
 
 - Builds:
 
-  - add arch linux build
+  - add arch linux build (done) - PKGBUILD in the repo root, plus an `arch-x86_64` job in the release workflow that builds it in the official archlinux container and publishes the .pkg.tar.zst with the release
 
 
 #### 0.1.7
@@ -640,8 +686,3 @@ for MacOS builds
 - ~~add ability to drag and drop panes in different locations, ie terminator behavior, move panes left, right etc~~
 - ~~add ability to drag a pane into a different tab, highlight the drop placement area on the new tab~~
 
-### Releasing
-
-    git tag -d v0.1.7
-    git tag v0.1.7
-    git push --force origin v0.1.7
