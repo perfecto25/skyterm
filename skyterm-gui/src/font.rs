@@ -9,6 +9,12 @@ use freetype::face::LoadFlag;
 static EMBEDDED_FONT_BYTES: &[u8] =
     include_bytes!("../resources/JetBrainsMono-Regular.ttf");
 
+/// The embedded font's raw bytes, for installing it where GTK/fontconfig can
+/// find it (so the chrome can render in the same face as the grid).
+pub fn embedded_font_bytes() -> &'static [u8] {
+    EMBEDDED_FONT_BYTES
+}
+
 /// Sentinel path returned by [`locate_monospace_font`] to signal "use the
 /// embedded font" without changing any of the PathBuf-based wiring in app.rs.
 pub const EMBEDDED_FONT_PATH: &str = ":embedded:JetBrainsMono-Regular:";

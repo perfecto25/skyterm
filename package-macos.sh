@@ -82,6 +82,9 @@ check_deps() {
 # ── Build ────────────────────────────────────────────────────────────────────
 
 build_release() {
+    info "Running tests..."
+    ./run-tests.sh || die "tests failed — not packaging"
+
     info "Building release binary..."
 
     # `--locked` is intentionally NOT passed here: it refuses to create/update

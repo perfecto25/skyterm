@@ -2,6 +2,7 @@ mod app;
 mod font;
 mod input;
 mod keymap;
+mod metrics;
 mod pty;
 mod renderer;
 

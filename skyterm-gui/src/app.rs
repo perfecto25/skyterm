@@ -21,6 +21,7 @@ use skyterm_core::{
 };
 
 use crate::font;
+use crate::metrics;
 use crate::input;
 use crate::keymap::{self, Action, Binding, Keymap, ShortcutStyle};
 use crate::pty;
@@ -46,13 +47,20 @@ const CHORD_TIMEOUT: Duration = Duration::from_secs(2);
 /// important paradoxically makes them lose to the theme's non-important rules,
 /// so the menu renders light. Plain declarations at high priority win cleanly.
 const CSS_DARK_MENU: &str = "
-popover.skyterm-menu,
 popover.skyterm-menu > contents,
 popover.skyterm-menu box,
 popover.skyterm-menu scrolledwindow,
 popover.skyterm-menu viewport {
     background-color: #1e1e1e;
     color:            #e0e0e0;
+}
+popover.skyterm-menu {
+    background: transparent;
+}
+popover.skyterm-menu > contents {
+    border: none;
+    border-radius: 12px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
 }
 popover.skyterm-menu modelbutton {
     color: #e0e0e0;
@@ -84,11 +92,70 @@ popover.skyterm-menu separator {
 ";
 
 const CSS_TEMPLATE: &str = "
+.skyterm-metrics {
+    font-family: __FONT_FAMILY__, monospace;
+    font-size: 12px;
+}
+/* Compact title bar: the theme's header bar is ~46px tall. */
+headerbar.skyterm-header {
+    min-height: 36px;
+    padding: 0 6px;
+}
+headerbar.skyterm-header windowcontrols button {
+    min-height: 20px;
+    min-width: 20px;
+    margin: 0 2px;
+    padding: 2px;
+}
+.skyterm-title {
+    font-size: 16px;
+    font-weight: bold;
+}
 .pane-wrap {
-    border: 2px solid transparent;
+    border: __BORDER__px solid transparent;
 }
 .pane-wrap.focused {
-    border-color: #5eb1ff;
+    border-color: #__HIGHLIGHT__;
+}
+/* About is an undecorated, transparent window that draws its own rounded
+   card: the window manager's frame can't be relied on for rounded bottom
+   corners (they come out square over light backgrounds). */
+window.skyterm-about,
+window.skyterm-about.csd,
+window.skyterm-about.solid-csd {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+}
+.skyterm-about-card {
+    background-color: #f6f6f6;
+    border-radius: 14px;
+    border: 1px solid rgba(0, 0, 0, 0.12);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+.skyterm-about-card label {
+    color: #2e2e2e;
+}
+.skyterm-about-card button.link,
+.skyterm-about-card button.link label {
+    color: #3584e4;
+}
+.skyterm-about-card label.dim-label {
+    color: #777777;
+}
+.skyterm-about-card button.skyterm-about-close {
+    min-width: 24px;
+    min-height: 24px;
+    padding: 0;
+    border-radius: 12px;
+    color: #555555;
+    background: transparent;
+    border: none;
+    box-shadow: none;
+}
+.skyterm-about-card button.skyterm-about-close:hover {
+    background: rgba(0, 0, 0, 0.10);
 }
 popover.menu,
 popover.menu label,
@@ -162,6 +229,9 @@ button.pane-close-btn:hover {
     background: rgba(192, 57, 43, 0.55);
     color: #ffffff;
 }
+.pane-dim {
+    background-color: #000000;
+}
 .pane-drop-highlight {
     background: rgba(46, 204, 113, 0.30);
     border: 2px solid rgba(46, 204, 113, 0.95);
@@ -202,7 +272,7 @@ enum SplitDir {
 /// A preset arrangement of panes built by composing single splits. Chosen from
 /// the right-click Layouts submenu (opens a new tab with the layout) and from
 /// the `default_layout` config applied to each new window on startup.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Layout {
     /// One pane (the default — no splits).
     Single,
@@ -248,11 +318,9 @@ struct WindowState {
     /// The pane that owns the currently-open (or last-opened) context menu.
     /// Menu actions read this so they know which pane to operate on.
     menu_target: RefCell<Option<Rc<Pane>>>,
-    /// Right-click menu when there are multiple panes (includes "Close pane").
+    /// Right-click menu. Always includes "Close pane" — swapping menu models
+    /// per popup leaves a stale, smaller layout that clips the bottom item.
     split_menu: gio::Menu,
-    /// Same menu without the close section — used when this would close the
-    /// last pane in the last tab (i.e. would empty the window).
-    split_menu_no_close: gio::Menu,
     /// Built-in presets + any user themes discovered in the themes folder.
     /// Settings reads from this list; first entry is the new-install default.
     available_themes: Vec<Theme>,
@@ -298,6 +366,38 @@ struct WindowState {
     confirm_window_close: Cell<bool>,
     /// Whether to show the floating drag/close toolbar on split panes.
     show_pane_toolbar: Cell<bool>,
+    /// Dim every pane except the focused one in each tab.
+    dim_non_selected: Cell<bool>,
+    /// How strongly to dim non-selected panes, as a percentage (0–50).
+    dim_percent: Cell<u32>,
+    /// Focused-pane border colour, 6 uppercase hex digits (no `#`).
+    highlight_color: RefCell<String>,
+    /// Whether the focused pane gets a highlight border at all.
+    highlight_enabled: Cell<bool>,
+    /// Thickness of that border in pixels (1–20).
+    highlight_size: Cell<u32>,
+    /// Show live system metrics in the title bar (Linux only).
+    metrics_enabled: Cell<bool>,
+    /// Seconds between metric refreshes, 1–60.
+    metrics_interval: Cell<u32>,
+    /// The title-bar label the metrics are written into.
+    metrics_label: gtk4::Label,
+    metrics_sampler: RefCell<metrics::Sampler>,
+    /// The title bar and its left-aligned "skyterm" title, kept so the metrics
+    /// can be hidden when there isn't room next to them.
+    header: gtk4::HeaderBar,
+    title_label: gtk4::Label,
+    /// Whether a reading is currently available to show.
+    metrics_has_reading: Cell<bool>,
+    /// A frame-tick that re-checks the metrics' fit is running / how many more
+    /// frames it should run (ticks only run for a few frames after a resize).
+    metrics_ticking: Cell<bool>,
+    metrics_pending: Cell<u8>,
+    /// Header width seen on the previous check, to tell when a resize settled.
+    metrics_last_width: Cell<i32>,
+    /// Bumped on every (re)start of the refresh timer; a running timer whose
+    /// generation is stale stops itself.
+    metrics_gen: Cell<u32>,
     /// Layout id (`single`/`2h`/`2v`/`3`/`4`) applied to each *new* window on
     /// startup. Changed from Settings; only affects windows opened afterward.
     default_layout: RefCell<String>,
@@ -380,6 +480,9 @@ struct Pane {
     /// pinned to the corresponding edge via halign/valign. Pointer-transparent
     /// so it doesn't block the underlying drop-target motion events.
     drop_highlight: gtk4::Box,
+    /// Black scrim laid over the pane while it's not the focused one in its
+    /// tab ("dim non-selected panes"). Opacity carries the dim strength.
+    dim_overlay: gtk4::Box,
     scrollbar: Scrollbar,
     scroll_adj: Adjustment,
     scroll_syncing: Cell<bool>,
@@ -434,6 +537,9 @@ pub fn on_activate(app: &Application) {
     // Install our app icon into a user-writable icon theme directory so the
     // window manager / shell can pick it up. Best-effort; ignore failure.
     install_app_icon();
+    // Make the embedded terminal font visible to GTK so the menu and other
+    // chrome can render in the same face as the grid.
+    install_embedded_font();
 
     // Load persisted settings before doing anything else, so the first pane
     // uses the saved font / theme / scrollback rather than defaults.
@@ -455,7 +561,23 @@ pub fn on_activate(app: &Application) {
 
     let initial_family =
         font::family_name(&font_path).unwrap_or_else(|_| "monospace".to_string());
-    let css_provider = install_css(&initial_family);
+    let highlight_color = cfg
+        .selected_pane_highlight_color
+        .as_deref()
+        .and_then(normalize_hex_color)
+        .unwrap_or_else(|| DEFAULT_HIGHLIGHT.to_string());
+    let highlight_enabled = cfg.selected_pane_highlight.unwrap_or(true);
+    let highlight_size = clamp_border_px(
+        cfg.selected_pane_highlight_border_size.unwrap_or(DEFAULT_BORDER_PX),
+    );
+    let css_provider = install_css(
+        &initial_family,
+        &highlight_color,
+        highlight_border_px(highlight_enabled, highlight_size),
+    );
+    let metrics_enabled = cfg.system_metrics_enabled.unwrap_or(true) && metrics::SUPPORTED;
+    let metrics_interval =
+        metrics::clamp_interval(cfg.system_metrics_interval_secs.unwrap_or(metrics::DEFAULT_INTERVAL_SECS));
 
     // First-pane atlas just so we can size the initial window sensibly.
     let initial_atlas = match font::build_atlas(&font_path, DEFAULT_FONT_SIZE_PX) {
@@ -474,6 +596,30 @@ pub fn on_activate(app: &Application) {
         .default_height((INITIAL_ROWS as u32 * initial_atlas.cell_h) as i32)
         .build();
 
+    // Title bar: a header bar (same title + window buttons as the default
+    // one) with the system-metrics label packed next to the window buttons.
+    let metrics_label = gtk4::Label::new(None);
+    metrics_label.add_css_class("skyterm-metrics");
+    metrics_label.add_css_class("dim-label");
+    metrics_label.set_visible(false);
+    metrics_label.set_margin_start(METRICS_GAP);
+    metrics_label.set_margin_end(METRICS_GAP);
+    // If it ever does get squeezed, ellipsize rather than overlap or force
+    // the window wider; `layout_metrics` hides it before that is visible.
+    metrics_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    let title_label = gtk4::Label::new(Some("skyterm"));
+    title_label.add_css_class("skyterm-title");
+    // Margins set in code (not CSS) so `metrics_fit` can account for them.
+    title_label.set_margin_start(8);
+    title_label.set_margin_end(8);
+    let header = gtk4::HeaderBar::new();
+    header.add_css_class("skyterm-header");
+    header.pack_start(&title_label);
+    header.pack_end(&metrics_label);
+    // An empty centre widget: the title lives on the left instead.
+    header.set_title_widget(Some(&gtk4::Box::new(Orientation::Horizontal, 0)));
+    window.set_titlebar(Some(&header));
+
     // Themes are needed both for the submenu and for WindowState. Built-in
     // presets first, then any user themes from `~/.config/skyterm/themes/*.toml`.
     // The names of user themes are tracked separately so the menu and the
@@ -484,96 +630,8 @@ pub fn on_activate(app: &Application) {
         user_themes.iter().map(|t| t.name.clone()).collect();
     available_themes.extend(user_themes);
 
-    // Build the two menu variants. They share the splits + clipboard
-    // sections (gio::Menu sections are referenced, not copied), so we only
-    // need to define them once.
-    // Terminator-style split naming: "Horizontally" = horizontal divider line
-    // = new pane below; "Vertically" = vertical divider line = new pane to the
-    // right. The four directional actions (split-left/right/up/down) used by
-    // the chord keybindings are still registered separately in
-    // `install_pane_actions` but no longer surfaced in the menu.
-    let splits = gio::Menu::new();
-    splits.append(Some("― Split Horizontally"), Some("pane.split-horizontal"));
-    splits.append(Some("| Split Vertically"),  Some("pane.split-vertical"));
-    // Toggle: enlarges the clicked pane over the rest, or restores the layout
-    // if it's already enlarged. Does nothing in a tab with one pane.
-    splits.append(Some("⛶ Focus Pane"),        Some("pane.focus-pane"));
+    let split_menu = build_menu_model(&available_themes, &user_theme_names);
 
-    // Layouts submenu — each opens a new tab pre-split into the chosen preset.
-    // "single" is omitted (that's just New Tab).
-    let layouts_submenu = gio::Menu::new();
-    for (id, label) in LAYOUT_CHOICES.iter().filter(|(id, _)| *id != "single") {
-        let item = gio::MenuItem::new(Some(label), None);
-        item.set_action_and_target_value(Some("pane.layout"), Some(&id.to_variant()));
-        layouts_submenu.append_item(&item);
-    }
-    splits.append_submenu(Some("Layouts"), &layouts_submenu);
-
-    splits.append(Some("New Tab"),            Some("pane.new-tab"));
-    splits.append(Some("New Window"),         Some("pane.new-window"));
-
-    // Window state — its own section so it reads apart from the pane/tab items.
-    let window_state = gio::Menu::new();
-    window_state.append(Some("Maximize Window"), Some("pane.maximize"));
-    window_state.append(Some("Minimize Window"), Some("pane.minimize"));
-
-    let clipboard = gio::Menu::new();
-    clipboard.append(Some("Copy"), Some("pane.copy"));
-    clipboard.append(Some("Paste"), Some("pane.paste"));
-    clipboard.append(Some("Select All"), Some("pane.select-all"));
-
-    // Themes submenu — Dark / Light for built-in presets, Custom (flat) for
-    // user-loaded themes regardless of brightness. Custom is omitted when no
-    // user themes were found.
-    let dark_items = gio::Menu::new();
-    let light_items = gio::Menu::new();
-    let custom_items = gio::Menu::new();
-    for t in &available_themes {
-        let item = gio::MenuItem::new(Some(t.name.as_str()), None);
-        item.set_action_and_target_value(
-            Some("pane.set-theme"),
-            Some(&t.name.to_variant()),
-        );
-        if user_theme_names.contains(&t.name) {
-            custom_items.append_item(&item);
-        } else if t.is_dark() {
-            dark_items.append_item(&item);
-        } else {
-            light_items.append_item(&item);
-        }
-    }
-    let themes_submenu = gio::Menu::new();
-    themes_submenu.append_section(Some("Dark"), &dark_items);
-    themes_submenu.append_section(Some("Light"), &light_items);
-    if !user_theme_names.is_empty() {
-        themes_submenu.append_section(Some("Custom"), &custom_items);
-    }
-
-    let prefs = gio::Menu::new();
-    prefs.append_submenu(Some("Themes"), &themes_submenu);
-    prefs.append(Some("Shortcuts…"), Some("pane.show-shortcuts"));
-    prefs.append(Some("Settings…"), Some("pane.settings"));
-    prefs.append(Some("About…"), Some("pane.about"));
-
-    // The destructive-action section uses a custom widget so we can render
-    // the red close styling the standard menu model can't express.
-    let danger = gio::Menu::new();
-    let close_item = gio::MenuItem::new(None, None);
-    close_item.set_attribute_value("custom", Some(&"close-pane".to_variant()));
-    danger.append_item(&close_item);
-
-    let split_menu = gio::Menu::new();
-    split_menu.append_section(None, &splits);
-    split_menu.append_section(None, &window_state);
-    split_menu.append_section(None, &clipboard);
-    split_menu.append_section(None, &prefs);
-    split_menu.append_section(None, &danger);
-
-    let split_menu_no_close = gio::Menu::new();
-    split_menu_no_close.append_section(None, &splits);
-    split_menu_no_close.append_section(None, &window_state);
-    split_menu_no_close.append_section(None, &clipboard);
-    split_menu_no_close.append_section(None, &prefs);
 
     // Tab container. The window's child is always the notebook; per-tab
     // pane trees live inside notebook pages.
@@ -628,6 +686,8 @@ pub fn on_activate(app: &Application) {
     let confirm_pane_close = cfg.confirm_pane_close.unwrap_or(true);
     let confirm_window_close = cfg.confirm_window_close.unwrap_or(true);
     let show_pane_toolbar = cfg.show_pane_toolbar.unwrap_or(true);
+    let dim_non_selected = cfg.dim_non_selected_panes.unwrap_or(true);
+    let dim_percent = cfg.dim_non_selected_percent.unwrap_or(5).min(MAX_DIM_PERCENT);
     let default_layout = cfg
         .default_layout
         .clone()
@@ -644,7 +704,6 @@ pub fn on_activate(app: &Application) {
         chord_at: Cell::new(None),
         menu_target: RefCell::new(None),
         split_menu,
-        split_menu_no_close,
         window: window.clone(),
         notebook: notebook.clone(),
         next_tab_number: Cell::new(1),
@@ -663,6 +722,22 @@ pub fn on_activate(app: &Application) {
         confirm_pane_close: Cell::new(confirm_pane_close),
         confirm_window_close: Cell::new(confirm_window_close),
         show_pane_toolbar: Cell::new(show_pane_toolbar),
+        dim_non_selected: Cell::new(dim_non_selected),
+        dim_percent: Cell::new(dim_percent),
+        highlight_color: RefCell::new(highlight_color),
+        highlight_enabled: Cell::new(highlight_enabled),
+        highlight_size: Cell::new(highlight_size),
+        metrics_enabled: Cell::new(metrics_enabled),
+        metrics_interval: Cell::new(metrics_interval),
+        metrics_label,
+        metrics_sampler: RefCell::new(metrics::Sampler::default()),
+        header,
+        title_label,
+        metrics_has_reading: Cell::new(false),
+        metrics_ticking: Cell::new(false),
+        metrics_pending: Cell::new(0),
+        metrics_last_width: Cell::new(0),
+        metrics_gen: Cell::new(0),
         default_layout: RefCell::new(default_layout),
         force_close: Cell::new(false),
         dragging: RefCell::new(None),
@@ -796,7 +871,282 @@ pub fn on_activate(app: &Application) {
         apply_scrollback_all(&state, lines);
     }
 
+    // Window resized → re-check whether the metrics still fit.
+    {
+        let weak = Rc::downgrade(&state);
+        window.connect_realize(move |w| {
+            use gtk4::prelude::NativeExt;
+            if let Some(surface) = w.surface() {
+                let weak = weak.clone();
+                surface.connect_layout(move |_, _, _| {
+                    if let Some(state) = weak.upgrade() {
+                        schedule_metrics_layout(&state);
+                    }
+                });
+            }
+        });
+    }
+    restart_metrics(&state);
     window.present();
+    #[cfg(test)]
+    TEST_STATE.with(|t| *t.borrow_mut() = Some(state.clone()));
+}
+
+// Test hook: the window state built by `on_activate`, so the GUI tests can
+// drive the real application.
+#[cfg(test)]
+thread_local! {
+    static TEST_STATE: RefCell<Option<Rc<WindowState>>> = const { RefCell::new(None) };
+}
+
+/// Take a reading and show it in the title bar (or hide the label when
+/// metrics are off / unavailable).
+fn update_metrics(state: &Rc<WindowState>) {
+    if !state.metrics_enabled.get() {
+        state.metrics_has_reading.set(false);
+        state.metrics_label.set_visible(false);
+        return;
+    }
+    match state.metrics_sampler.borrow_mut().sample() {
+        Some(m) => {
+            state.metrics_label.set_text(&m.summary());
+            state.metrics_label.set_tooltip_text(Some(&m.details()));
+            state.metrics_has_reading.set(true);
+        }
+        None => state.metrics_has_reading.set(false),
+    }
+    layout_metrics(state);
+    // The text width changed, so re-check once the new size has been laid out.
+    schedule_metrics_layout(state);
+}
+
+/// Minimum blank space (px) kept on each side of the metrics text, between it
+/// and the title on one side and the window buttons on the other.
+const METRICS_GAP: i32 = 8;
+/// Extra room the header bar itself puts between its children.
+const HEADER_SPACING: i32 = 12;
+
+/// Left edge (in `header` coordinates) of the visible window buttons — the
+/// `GtkWindowControls` are nested a few levels down inside the header — or the
+/// header's right edge when there are none.
+fn window_buttons_left(header: &gtk4::HeaderBar) -> f32 {
+    fn walk(w: &gtk4::Widget, header: &gtk4::HeaderBar, left: &mut f32) {
+        if w.is::<gtk4::WindowControls>() && w.is_visible() && w.width() > 0 {
+            if let Some(b) = w.compute_bounds(header) {
+                *left = left.min(b.x());
+            }
+        }
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            walk(&c, header, left);
+            child = c.next_sibling();
+        }
+    }
+    let mut left = header.width() as f32;
+    walk(header.upcast_ref(), header, &mut left);
+    left
+}
+
+/// Is there room in the title bar for the metrics text with a clear gap on
+/// both sides? Measured from the real layout: the space between the title's
+/// right edge and the window buttons' left edge.
+fn metrics_fit(state: &Rc<WindowState>) -> bool {
+    let header = &state.header;
+    if header.width() == 0 {
+        return true; // not laid out yet — don't hide on a guess
+    }
+    let Some(title) = state.title_label.compute_bounds(header) else {
+        return true;
+    };
+    let title_right = title.x() + title.width();
+    let controls_left = window_buttons_left(header);
+    let text = state.metrics_label.text();
+    let text_px = state
+        .metrics_label
+        .create_pango_layout(Some(text.as_str()))
+        .pixel_size()
+        .0;
+    // The title's own right margin sits between it and the metrics too.
+    let need = text_px + 2 * METRICS_GAP + 2 * HEADER_SPACING + state.title_label.margin_end();
+    controls_left - title_right >= need as f32
+}
+
+/// Frames of unchanged header width after which the metrics re-check stops.
+const METRICS_SETTLE_FRAMES: u8 = 8;
+
+/// Show the metrics only when there's a reading and it fits.
+fn layout_metrics(state: &Rc<WindowState>) {
+    let show = state.metrics_enabled.get()
+        && state.metrics_has_reading.get()
+        && metrics_fit(state);
+    state.metrics_label.set_visible(show);
+}
+
+/// Re-run [`layout_metrics`] for the next few frames. GTK has no "allocation
+/// changed" signal, so after a resize we poll briefly — only while resizing,
+/// never as a permanent frame-clock subscription (that would keep the GPU
+/// awake).
+fn schedule_metrics_layout(state: &Rc<WindowState>) {
+    state.metrics_pending.set(METRICS_SETTLE_FRAMES);
+    if state.metrics_ticking.replace(true) {
+        return;
+    }
+    let weak = Rc::downgrade(state);
+    state.header.add_tick_callback(move |_, _| {
+        let Some(state) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        layout_metrics(&state);
+        // Keep checking until the bar's width has been stable for a few
+        // frames: on X11 the new size can arrive several frames after the
+        // resize starts.
+        let w = state.header.width();
+        let left = if w != state.metrics_last_width.get() {
+            state.metrics_last_width.set(w);
+            METRICS_SETTLE_FRAMES
+        } else {
+            state.metrics_pending.get().saturating_sub(1)
+        };
+        state.metrics_pending.set(left);
+        if left == 0 {
+            state.metrics_ticking.set(false);
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
+
+/// (Re)start the refresh timer after the toggle or the interval changed. The
+/// first reading is only a CPU baseline, so a second one follows a second
+/// later to show a CPU percentage promptly instead of after a full interval.
+fn restart_metrics(state: &Rc<WindowState>) {
+    let generation = state.metrics_gen.get().wrapping_add(1);
+    state.metrics_gen.set(generation);
+    state.metrics_sampler.borrow_mut().reset();
+    update_metrics(state);
+    if !state.metrics_enabled.get() {
+        return;
+    }
+    let weak = Rc::downgrade(state);
+    glib::timeout_add_local_once(Duration::from_secs(1), {
+        let weak = weak.clone();
+        move || {
+            if let Some(state) = weak.upgrade() {
+                if state.metrics_gen.get() == generation {
+                    update_metrics(&state);
+                }
+            }
+        }
+    });
+    let interval = Duration::from_secs(state.metrics_interval.get() as u64);
+    glib::timeout_add_local(interval, move || {
+        let Some(state) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if state.metrics_gen.get() != generation {
+            return glib::ControlFlow::Break;
+        }
+        update_metrics(&state);
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Width the right-click menu never shrinks below — wide enough for the
+/// longest theme name ("Skyterm Dracula" / "Solarized Dark") in the terminal
+/// font plus button padding.
+const MENU_MIN_WIDTH: i32 = 240;
+
+/// Build the right-click menu model. Pure `gio` — no display needed — so the
+/// tests can inspect its structure. The last section is always the red
+/// "Close pane" custom slot: swapping between menu variants per popup leaves
+/// a stale, smaller layout that clips the bottom item.
+fn build_menu_model(
+    available_themes: &[Theme],
+    user_theme_names: &std::collections::HashSet<String>,
+) -> gio::Menu {
+    // Terminator-style split naming: "Horizontally" = horizontal divider line
+    // = new pane below; "Vertically" = vertical divider line = new pane to the
+    // right. The four directional actions (split-left/right/up/down) used by
+    // the chord keybindings are still registered separately in
+    // `install_pane_actions` but no longer surfaced in the menu.
+    let splits = gio::Menu::new();
+    splits.append(Some("― Split Horizontally"), Some("pane.split-horizontal"));
+    splits.append(Some("| Split Vertically"),  Some("pane.split-vertical"));
+    // Toggle: enlarges the clicked pane over the rest, or restores the layout
+    // if it's already enlarged. Does nothing in a tab with one pane.
+    splits.append(Some("⛶ Focus Pane"),        Some("pane.focus-pane"));
+
+    // Layouts submenu — each opens a new tab pre-split into the chosen preset.
+    // "single" is omitted (that's just New Tab).
+    let layouts_submenu = gio::Menu::new();
+    for (id, label) in LAYOUT_CHOICES.iter().filter(|(id, _)| *id != "single") {
+        let item = gio::MenuItem::new(Some(label), None);
+        item.set_action_and_target_value(Some("pane.layout"), Some(&id.to_variant()));
+        layouts_submenu.append_item(&item);
+    }
+    splits.append_submenu(Some("Layouts"), &layouts_submenu);
+
+    splits.append(Some("New Tab"),            Some("pane.new-tab"));
+    splits.append(Some("New Window"),         Some("pane.new-window"));
+
+    // Window state — its own section so it reads apart from the pane/tab items.
+    let window_state = gio::Menu::new();
+    window_state.append(Some("Maximize Window"), Some("pane.maximize"));
+    window_state.append(Some("Minimize Window"), Some("pane.minimize"));
+
+    let clipboard = gio::Menu::new();
+    clipboard.append(Some("Copy"), Some("pane.copy"));
+    clipboard.append(Some("Paste"), Some("pane.paste"));
+    clipboard.append(Some("Select All"), Some("pane.select-all"));
+
+    // Themes submenu — Dark / Light for built-in presets, Custom (flat) for
+    // user-loaded themes regardless of brightness. Custom is omitted when no
+    // user themes were found.
+    let dark_items = gio::Menu::new();
+    let light_items = gio::Menu::new();
+    let custom_items = gio::Menu::new();
+    for t in available_themes {
+        let item = gio::MenuItem::new(Some(t.name.as_str()), None);
+        item.set_action_and_target_value(
+            Some("pane.set-theme"),
+            Some(&t.name.to_variant()),
+        );
+        if user_theme_names.contains(&t.name) {
+            custom_items.append_item(&item);
+        } else if t.is_dark() {
+            dark_items.append_item(&item);
+        } else {
+            light_items.append_item(&item);
+        }
+    }
+    let themes_submenu = gio::Menu::new();
+    themes_submenu.append_section(Some("Dark"), &dark_items);
+    themes_submenu.append_section(Some("Light"), &light_items);
+    if !user_theme_names.is_empty() {
+        themes_submenu.append_section(Some("Custom"), &custom_items);
+    }
+
+    let prefs = gio::Menu::new();
+    prefs.append_submenu(Some("Themes"), &themes_submenu);
+    prefs.append(Some("Shortcuts…"), Some("pane.show-shortcuts"));
+    prefs.append(Some("Settings…"), Some("pane.settings"));
+    prefs.append(Some("About…"), Some("pane.about"));
+
+    // The destructive-action section uses a custom widget so we can render
+    // the red close styling the standard menu model can't express.
+    let danger = gio::Menu::new();
+    let close_item = gio::MenuItem::new(None, None);
+    close_item.set_attribute_value("custom", Some(&"close-pane".to_variant()));
+    danger.append_item(&close_item);
+
+    let split_menu = gio::Menu::new();
+    split_menu.append_section(None, &splits);
+    split_menu.append_section(None, &window_state);
+    split_menu.append_section(None, &clipboard);
+    split_menu.append_section(None, &prefs);
+    split_menu.append_section(None, &danger);
+    split_menu
 }
 
 /// The pane an action should operate on. When a popover is open, that's the
@@ -1355,6 +1705,10 @@ fn make_tab(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Tab>> {
     }
 
     pane.is_focused.set(true);
+    // `focus_pane` early-returns for an already-focused pane, so the highlight
+    // border has to be applied here or a new tab's first pane has none until
+    // it's clicked.
+    pane.wrap.add_css_class("focused");
     let tab = Rc::new(Tab {
         container,
         panes: RefCell::new(vec![pane.clone()]),
@@ -1482,6 +1836,32 @@ fn close_tab(state: &Rc<WindowState>, tab: &Rc<Tab>) {
     update_all_pane_toolbars(state);
 }
 
+/// Write the embedded terminal font into the user's font directory so
+/// fontconfig (and therefore GTK's CSS `font-family`) can resolve it. Without
+/// this the chrome falls back to a generic monospace on machines that don't
+/// have JetBrains Mono installed. Must run before GTK first lays out text.
+/// Best-effort; errors are ignored.
+fn install_embedded_font() {
+    let Some(data_root) = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+    else {
+        return;
+    };
+    let dir = data_root.join("fonts/skyterm");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let target = dir.join("JetBrainsMono-Regular.ttf");
+    let bytes = font::embedded_font_bytes();
+    let up_to_date = std::fs::metadata(&target)
+        .map(|m| m.len() == bytes.len() as u64)
+        .unwrap_or(false);
+    if !up_to_date {
+        let _ = std::fs::write(&target, bytes);
+    }
+}
+
 /// Write the embedded `skyterm.svg` to the user's icon theme search path and
 /// register that path with the active `IconTheme`, so windows that ask for
 /// `icon_name = "skyterm"` find it. We write to `$XDG_DATA_HOME/icons` (or
@@ -1522,19 +1902,48 @@ fn install_app_icon() {
 
 /// Substitute the configured terminal font's family name into [`CSS_TEMPLATE`]
 /// so the menu / banner / split buttons render in the same face as the grid.
-fn build_css(family: &str) -> String {
+fn build_css(family: &str, highlight: &str, border_px: u32) -> String {
     // CSS strings are quoted to handle multi-word names ("DejaVu Sans Mono").
     let quoted = format!("\"{}\"", family.replace('"', ""));
-    CSS_TEMPLATE.replace("__FONT_FAMILY__", &quoted)
+    CSS_TEMPLATE
+        .replace("__FONT_FAMILY__", &quoted)
+        .replace("__HIGHLIGHT__", highlight)
+        .replace("__BORDER__", &border_px.to_string())
+}
+
+/// Default / allowed thickness (px) of the focused-pane highlight border.
+const DEFAULT_BORDER_PX: u32 = 2;
+const MIN_BORDER_PX: u32 = 1;
+const MAX_BORDER_PX: u32 = 20;
+
+fn clamp_border_px(px: u32) -> u32 {
+    px.clamp(MIN_BORDER_PX, MAX_BORDER_PX)
+}
+
+/// The pane-wrap border width to put in the stylesheet: the configured size,
+/// or none at all when the highlight is off (no border, so panes also sit
+/// flush instead of leaving an empty transparent frame).
+fn highlight_border_px(enabled: bool, size: u32) -> u32 {
+    if enabled { clamp_border_px(size) } else { 0 }
+}
+
+/// Default selected-pane border colour (hex, no `#`).
+const DEFAULT_HIGHLIGHT: &str = "FF3399";
+
+/// Normalize a user-typed hex colour to 6 uppercase hex digits, or `None` if
+/// it isn't one. A leading `#` is accepted.
+fn normalize_hex_color(s: &str) -> Option<String> {
+    let t = s.trim().trim_start_matches('#');
+    (t.len() == 6 && t.chars().all(|c| c.is_ascii_hexdigit())).then(|| t.to_ascii_uppercase())
 }
 
 /// Create the chrome CSS provider, register it with the default display, and
 /// load it with the initial font family. The provider is returned so it can
 /// be re-loaded later (see [`apply_chrome_font`]) when the user picks a
 /// different font in Settings.
-fn install_css(family: &str) -> CssProvider {
+fn install_css(family: &str, highlight: &str, border_px: u32) -> CssProvider {
     let provider = CssProvider::new();
-    provider.load_from_string(&build_css(family));
+    provider.load_from_string(&build_css(family, highlight, border_px));
     if let Some(display) = gdk::Display::default() {
         gtk4::style_context_add_provider_for_display(
             &display,
@@ -1561,7 +1970,9 @@ fn install_css(family: &str) -> CssProvider {
 fn apply_chrome_font(state: &Rc<WindowState>) {
     let path = state.font_path.borrow().clone();
     let family = font::family_name(&path).unwrap_or_else(|_| "monospace".to_string());
-    state.css_provider.load_from_string(&build_css(&family));
+    let highlight = state.highlight_color.borrow().clone();
+    let border = highlight_border_px(state.highlight_enabled.get(), state.highlight_size.get());
+    state.css_provider.load_from_string(&build_css(&family, &highlight, border));
 }
 
 /// Build a fresh pane: spawn a PTY, build a GLArea + scrollbar, hook up the
@@ -1679,8 +2090,17 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
     drop_highlight.set_can_target(false);
     drop_highlight.set_focusable(false);
 
+    // Dim scrim: a black box whose opacity is the dim strength. Pointer-
+    // transparent for the same reason as the drop highlight.
+    let dim_overlay = gtk4::Box::new(Orientation::Horizontal, 0);
+    dim_overlay.add_css_class("pane-dim");
+    dim_overlay.set_visible(false);
+    dim_overlay.set_can_target(false);
+    dim_overlay.set_focusable(false);
+
     let overlay = gtk4::Overlay::new();
     overlay.set_child(Some(&gl_area));
+    overlay.add_overlay(&dim_overlay);
     // Highlight first, toolbar second — toolbar must stay on top so the close
     // button is clickable even while a drop highlight is showing. The scrollbar
     // is NOT an overlay: it's a sibling of the overlay in `inner` (below) so it
@@ -1705,6 +2125,7 @@ fn make_pane(state: Rc<WindowState>, cols: u16, rows: u16) -> Option<Rc<Pane>> {
         gl_area,
         toolbar,
         drop_highlight,
+        dim_overlay,
         scrollbar,
         scroll_adj,
         scroll_syncing: Cell::new(false),
@@ -2373,15 +2794,30 @@ fn wire_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
     // Enforce a minimum width wide enough for the longest theme name
     // ("Skyterm Dracula" / "Solarized Dark" at ~14 chars in Fira Code 14px)
     // plus button padding. Height is unconstrained (-1); content drives it.
-    popover.set_size_request(240, -1);
+    popover.set_size_request(MENU_MIN_WIDTH, -1);
     // PopoverMenu wraps its content in an internal GtkScrolledWindow whose
     // default max-content-height is small enough that our 6-item menu
     // overflows and gets a scrollbar. Override on every show — the inner
     // widgets are created lazily so we can't catch them at construction.
     {
         let state_w = Rc::downgrade(state);
+        let first_shown = Cell::new(false);
         popover.connect_show(move |p| {
             unconstrain_scrolled_windows(p.upcast_ref::<gtk4::Widget>());
+            // The very first popup is sized before the scroller is un-clipped,
+            // so GTK caps it at the window height and the bottom items (Close
+            // pane) are cut off whenever the menu doesn't fit below the
+            // pointer. Every later popup is fine, so on the first show only,
+            // re-present once the first layout has happened.
+            if !first_shown.replace(true) {
+                let weak = p.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(p) = weak.upgrade() {
+                        p.popdown();
+                        p.popup();
+                    }
+                });
+            }
             colorize_menu_items(p.upcast_ref::<gtk4::Widget>());
             // Drop GTK's automatic accelerator hints when they'd only apply to
             // some of the items (see `menu_accels_useful`). Done on every show
@@ -2624,19 +3060,11 @@ fn show_pane_menu(state: &Rc<WindowState>, pane: &Rc<Pane>, at: Option<(f64, f64
         .map(|p| (p.x() as f64, p.y() as f64))
         .unwrap_or((x, y));
     *state.menu_target.borrow_mut() = Some(pane.clone());
-    // Swap in the menu variant that matches the current state: hide "Close
-    // pane" only when closing it would empty the entire window (i.e. last pane
-    // in last tab). With multiple tabs, the close action just closes the tab.
-    let tabs = state.tabs.borrow().len();
-    let panes_here = current_tab(state)
-        .map(|t| t.panes.borrow().len())
-        .unwrap_or(0);
-    let model = if tabs > 1 || panes_here > 1 {
-        &state.split_menu
-    } else {
-        &state.split_menu_no_close
-    };
-    popover.set_menu_model(Some(model));
+    // Un-clip the internal scroller *before* the first popup. Doing it only in
+    // `connect_show` is too late for the very first layout: GTK caps the
+    // popover at the window's height and the bottom items (Close pane) are
+    // cut off whenever the menu doesn't fit below the pointer.
+    unconstrain_scrolled_windows(popover.upcast_ref::<gtk4::Widget>());
     let rect = gdk::Rectangle::new(px as i32, py as i32, 1, 1);
     popover.set_pointing_to(Some(&rect));
     popover.popup();
@@ -2663,16 +3091,21 @@ fn focus_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
     let prev = tab.focused.borrow().clone();
     if let Some(prev) = &prev {
         if Rc::ptr_eq(prev, pane) {
+            apply_pane_dimming(state, &tab);
             pane.gl_area.grab_focus();
             return;
         }
         prev.wrap.remove_css_class("focused");
         prev.is_focused.set(false);
+        // Selections belong to the focused pane; leaving one highlighted in a
+        // pane you've moved away from reads as a stray block.
+        clear_selection(prev);
         prev.gl_area.queue_render();
     }
     pane.is_focused.set(true);
     pane.wrap.add_css_class("focused");
     *tab.focused.borrow_mut() = Some(pane.clone());
+    apply_pane_dimming(state, &tab);
 
     // Bring the tab to the foreground if it isn't already.
     if let Some(page_num) = state.notebook.page_num(&tab.container) {
@@ -2681,6 +3114,41 @@ fn focus_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
         }
     }
     pane.gl_area.grab_focus();
+}
+
+/// Upper bound for the "dim non-selected panes" setting. Past this the dimmed
+/// panes get hard to read, which defeats the point of a subtle focus cue.
+const MAX_DIM_PERCENT: u32 = 50;
+
+/// Dim every pane in `tab` except the focused one by laying a translucent
+/// black scrim, at the configured percentage, over it. A tab with one pane
+/// never dims. Cheap and idempotent — called whenever focus or the setting
+/// changes.
+fn apply_pane_dimming(state: &Rc<WindowState>, tab: &Rc<Tab>) {
+    let dim = state.dim_non_selected.get();
+    let percent = state.dim_percent.get();
+    let focused = tab.focused.borrow().clone();
+    for p in tab.panes.borrow().iter() {
+        let is_focused = focused.as_ref().is_some_and(|f| Rc::ptr_eq(f, p));
+        let scrim = dim_scrim(dim, percent, is_focused);
+        p.dim_overlay.set_opacity(scrim.unwrap_or(0.0));
+        p.dim_overlay.set_visible(scrim.is_some());
+    }
+}
+
+/// Opacity of the black scrim over a pane, or `None` for no scrim. Only
+/// unfocused panes dim, only when the setting is on, and a 0% strength means
+/// no scrim at all. The percentage is clamped to [`MAX_DIM_PERCENT`].
+fn dim_scrim(enabled: bool, percent: u32, is_focused: bool) -> Option<f64> {
+    let strength = percent.min(MAX_DIM_PERCENT) as f64 / 100.0;
+    (enabled && !is_focused && strength > 0.0).then_some(strength)
+}
+
+/// Re-apply [`apply_pane_dimming`] to every tab (setting changed).
+fn apply_pane_dimming_all(state: &Rc<WindowState>) {
+    for tab in state.tabs.borrow().iter() {
+        apply_pane_dimming(state, tab);
+    }
 }
 
 /// Share of each divider's travel handed to the focused pane's side in focus
@@ -2975,8 +3443,49 @@ fn apply_layout(state: &Rc<WindowState>, base: &Rc<Pane>, layout: Layout) {
 /// Close a pane, optionally behind the confirmation dialog when
 /// `confirm_pane_close` is set. Used by the right-click menu's Close action
 /// and the floating toolbar's X button.
+/// What to ask before closing a pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseConfirm {
+    /// It's the only pane of the only tab: closing it quits skyterm. Always
+    /// asked, whatever the "confirm pane close" setting says.
+    LastPane,
+    /// An ordinary pane close, asked only when the setting is on.
+    Pane,
+    None,
+}
+
+fn close_confirmation(tabs: usize, panes_in_tab: usize, confirm_pane_close: bool) -> CloseConfirm {
+    if tabs == 1 && panes_in_tab == 1 {
+        CloseConfirm::LastPane
+    } else if confirm_pane_close {
+        CloseConfirm::Pane
+    } else {
+        CloseConfirm::None
+    }
+}
+
 fn request_close_pane(state: &Rc<WindowState>, pane: &Rc<Pane>) {
-    if state.confirm_pane_close.get() {
+    // Closing the only pane of the only tab ends the whole session, so that
+    // always asks first, regardless of the "confirm pane close" setting.
+    let panes_in_tab = tab_of_pane(state, pane)
+        .map(|t| t.panes.borrow().len())
+        .unwrap_or(0);
+    let confirm = close_confirmation(
+        state.tabs.borrow().len(),
+        panes_in_tab,
+        state.confirm_pane_close.get(),
+    );
+    if confirm == CloseConfirm::LastPane {
+        let state = state.clone();
+        let pane = pane.clone();
+        confirm_close(
+            &state.window.clone(),
+            "This is the last pane. Closing it will close skyterm. Close anyway?",
+            move || {
+                close_pane(&state, &pane);
+            },
+        );
+    } else if confirm == CloseConfirm::Pane {
         let state = state.clone();
         let pane = pane.clone();
         confirm_close(
@@ -3379,7 +3888,15 @@ fn select_word(pane: &Pane, row: usize, col: usize) {
     // Work in logical (absolute) coordinates so the selection is consistent
     // with drag-selections and survives scrolling.
     let lrow = g.view_to_logical(row);
-    let (start, end) = if is_word_char(g.logical_cell(lrow, col).ch) {
+    let clicked = g.logical_cell(lrow, col).ch;
+    // A double-click on empty space selects nothing; highlighting a lone blank
+    // cell just leaves a stray block behind.
+    if clicked == ' ' || clicked == '\0' {
+        drop(g);
+        clear_selection(pane);
+        return;
+    }
+    let (start, end) = if is_word_char(clicked) {
         let mut s = col;
         while s > 0 && is_word_char(g.logical_cell(lrow, s - 1).ch) {
             s -= 1;
@@ -3426,7 +3943,13 @@ fn select_line(pane: &Pane, row: usize) {
     while last_col > 0 && g.logical_cell(end, last_col).ch == ' ' {
         last_col -= 1;
     }
+    // A blank line selects nothing (see `select_word`).
+    let blank = start == end && last_col == 0 && matches!(g.logical_cell(end, 0).ch, ' ' | '\0');
     drop(g);
+    if blank {
+        clear_selection(pane);
+        return;
+    }
     *pane.selection.borrow_mut() = Some(Selection {
         anchor: (start, 0),
         active: (end, last_col),
@@ -4101,6 +4624,13 @@ fn save_config(state: &Rc<WindowState>) {
         confirm_pane_close: Some(state.confirm_pane_close.get()),
         confirm_window_close: Some(state.confirm_window_close.get()),
         show_pane_toolbar: Some(state.show_pane_toolbar.get()),
+        dim_non_selected_panes: Some(state.dim_non_selected.get()),
+        dim_non_selected_percent: Some(state.dim_percent.get()),
+        selected_pane_highlight_color: Some(state.highlight_color.borrow().clone()),
+        selected_pane_highlight: Some(state.highlight_enabled.get()),
+        selected_pane_highlight_border_size: Some(state.highlight_size.get()),
+        system_metrics_enabled: Some(state.metrics_enabled.get()),
+        system_metrics_interval_secs: Some(state.metrics_interval.get()),
         default_layout: Some(state.default_layout.borrow().clone()),
         shortcut_style: Some(state.keymap.borrow().style().id().to_string()),
         // Only written once the user has actually recorded something, so a
@@ -4126,9 +4656,23 @@ fn open_about(state: &Rc<WindowState>) {
     let dialog = gtk4::Window::new();
     dialog.set_title(Some("About Skyterm"));
     dialog.set_transient_for(Some(&state.window));
-    dialog.set_modal(true);
+    dialog.add_css_class("skyterm-about");
+    dialog.set_decorated(false);
+    // Not modal: clicking anywhere outside the dialog moves focus away from it
+    // and dismisses it (a modal dialog would swallow that click instead).
+    dialog.set_modal(false);
     dialog.set_resizable(false);
-    dialog.set_default_size(320, -1);
+    dialog.set_default_size(368, -1);
+    {
+        let was_active = std::cell::Cell::new(false);
+        dialog.connect_is_active_notify(move |d| {
+            if d.is_active() {
+                was_active.set(true);
+            } else if was_active.get() {
+                d.close();
+            }
+        });
+    }
 
     let vbox = gtk4::Box::new(Orientation::Vertical, 16);
     vbox.set_margin_top(32);
@@ -4136,6 +4680,20 @@ fn open_about(state: &Rc<WindowState>) {
     vbox.set_margin_start(32);
     vbox.set_margin_end(32);
     vbox.set_halign(Align::Center);
+    vbox.set_hexpand(true);
+
+    // Logo above the title. Embedded PNG decoded directly so it shows even
+    // when the icon theme has no `skyterm` entry (e.g. a fresh install).
+    let logo = gdk::Texture::from_bytes(&glib::Bytes::from_static(include_bytes!(
+        "../resources/skyterm_sm.png"
+    )))
+    .ok()
+    .map(|tex| {
+        let img = gtk4::Image::from_paintable(Some(&tex));
+        img.set_pixel_size(96);
+        img.set_halign(Align::Center);
+        img
+    });
 
     let name_label = Label::new(Some("Skyterm"));
     name_label.add_css_class("title-1");
@@ -4152,12 +4710,53 @@ fn open_about(state: &Rc<WindowState>) {
     let repo_btn = LinkButton::with_label(REPO, "GitHub Repository");
     repo_btn.set_halign(Align::Center);
 
+    if let Some(logo) = &logo {
+        vbox.append(logo);
+    }
     vbox.append(&name_label);
     vbox.append(&version_label);
     vbox.append(&desc_label);
     vbox.append(&repo_btn);
 
-    dialog.set_child(Some(&vbox));
+    // The card: content + a small close button in the corner. The outer
+    // margin leaves room (inside the transparent window) for the card's shadow.
+    let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+    close_btn.add_css_class("skyterm-about-close");
+    close_btn.set_halign(Align::End);
+    close_btn.set_valign(Align::Start);
+    close_btn.set_margin_top(10);
+    close_btn.set_margin_end(10);
+    {
+        let dialog = dialog.clone();
+        close_btn.connect_clicked(move |_| dialog.close());
+    }
+    let card_overlay = gtk4::Overlay::new();
+    card_overlay.set_child(Some(&vbox));
+    card_overlay.add_overlay(&close_btn);
+    card_overlay.add_css_class("skyterm-about-card");
+    card_overlay.set_margin_top(24);
+    card_overlay.set_margin_bottom(28);
+    card_overlay.set_margin_start(24);
+    card_overlay.set_margin_end(24);
+    // Undecorated, so give it a drag handle and an Escape-to-close.
+    let handle = gtk4::WindowHandle::new();
+    handle.set_child(Some(&card_overlay));
+    {
+        let key = EventControllerKey::new();
+        let dialog_w = dialog.downgrade();
+        key.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gdk::Key::Escape {
+                if let Some(d) = dialog_w.upgrade() {
+                    d.close();
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        dialog.add_controller(key);
+    }
+
+    dialog.set_child(Some(&handle));
     dialog.present();
 }
 
@@ -4569,7 +5168,161 @@ fn open_settings(state: &Rc<WindowState>) {
     }
     behavior.attach(&layout_dd, 1, 10, 1, 1);
 
-    notebook.append_page(&behavior, Some(&Label::new(Some("Behavior"))));
+    // Dim the panes that don't have focus.
+    behavior.attach(&row_label("Dim non-selected panes"), 0, 11, 1, 1);
+    let dim_switch = gtk4::Switch::new();
+    dim_switch.set_active(state.dim_non_selected.get());
+    dim_switch.set_halign(Align::Start);
+    dim_switch.set_tooltip_text(Some(
+        "Slightly dim every pane in a tab except the focused one.",
+    ));
+    {
+        let state = state.clone();
+        dim_switch.connect_active_notify(move |sw| {
+            state.dim_non_selected.set(sw.is_active());
+            apply_pane_dimming_all(&state);
+            save_config(&state);
+        });
+    }
+    behavior.attach(&dim_switch, 1, 11, 1, 1);
+
+    behavior.attach(&row_label("Dim % of non-selected panes"), 0, 12, 1, 1);
+    let dim_spin = SpinButton::with_range(0.0, MAX_DIM_PERCENT as f64, 1.0);
+    dim_spin.set_value(state.dim_percent.get() as f64);
+    dim_spin.set_halign(Align::Start);
+    dim_spin.set_tooltip_text(Some("How much to dim non-selected panes (0–50%)."));
+    {
+        let state = state.clone();
+        dim_spin.connect_value_changed(move |s| {
+            state.dim_percent.set(s.value() as u32);
+            apply_pane_dimming_all(&state);
+            save_config(&state);
+        });
+    }
+    behavior.attach(&dim_spin, 1, 12, 1, 1);
+
+    // Focused-pane highlight: on/off, border thickness, colour. The last two
+    // only mean something while the highlight is on, so they grey out with it.
+    let hl_switch_label = row_label("Selected pane highlight");
+    behavior.attach(&hl_switch_label, 0, 13, 1, 1);
+    let hl_switch = gtk4::Switch::new();
+    hl_switch.set_widget_name("setting-highlight-switch");
+    hl_switch.set_active(state.highlight_enabled.get());
+    hl_switch.set_halign(Align::Start);
+    hl_switch.set_tooltip_text(Some("Draw a coloured border around the focused pane."));
+    behavior.attach(&hl_switch, 1, 13, 1, 1);
+
+    let hl_size_label = row_label("Highlight border size (px)");
+    hl_size_label.set_widget_name("setting-highlight-size-label");
+    behavior.attach(&hl_size_label, 0, 14, 1, 1);
+    let hl_size = SpinButton::with_range(MIN_BORDER_PX as f64, MAX_BORDER_PX as f64, 1.0);
+    hl_size.set_widget_name("setting-highlight-size");
+    hl_size.set_value(state.highlight_size.get() as f64);
+    hl_size.set_halign(Align::Start);
+    hl_size.set_tooltip_text(Some("Thickness of the focused-pane border (1–20 px)."));
+    {
+        let state = state.clone();
+        hl_size.connect_value_changed(move |s| {
+            state.highlight_size.set(clamp_border_px(s.value() as u32));
+            apply_chrome_font(&state);
+            save_config(&state);
+        });
+    }
+    behavior.attach(&hl_size, 1, 14, 1, 1);
+
+    let hl_color_label = row_label("Selected pane highlight color");
+    hl_color_label.set_widget_name("setting-highlight-color-label");
+    behavior.attach(&hl_color_label, 0, 15, 1, 1);
+    let hl_entry = gtk4::Entry::new();
+    hl_entry.set_widget_name("setting-highlight-color");
+    hl_entry.set_max_length(7);
+    hl_entry.set_width_chars(9);
+    hl_entry.set_halign(Align::Start);
+    hl_entry.set_placeholder_text(Some(DEFAULT_HIGHLIGHT));
+    hl_entry.set_text(&state.highlight_color.borrow());
+    hl_entry.set_tooltip_text(Some("Hex color of the focused pane's border, e.g. FF3399."));
+    {
+        let state = state.clone();
+        hl_entry.connect_changed(move |e| match normalize_hex_color(&e.text()) {
+            Some(hex) => {
+                e.remove_css_class("error");
+                *state.highlight_color.borrow_mut() = hex;
+                apply_chrome_font(&state);
+                save_config(&state);
+            }
+            None => e.add_css_class("error"),
+        });
+    }
+    behavior.attach(&hl_entry, 1, 15, 1, 1);
+
+    // Grey the dependent settings out when the highlight is off.
+    let sync_highlight_sensitivity = {
+        let (a, b, c, d) = (hl_size_label.clone(), hl_size.clone(), hl_color_label.clone(), hl_entry.clone());
+        move |on: bool| {
+            a.set_sensitive(on);
+            b.set_sensitive(on);
+            c.set_sensitive(on);
+            d.set_sensitive(on);
+        }
+    };
+    sync_highlight_sensitivity(state.highlight_enabled.get());
+    {
+        let state = state.clone();
+        hl_switch.connect_active_notify(move |sw| {
+            state.highlight_enabled.set(sw.is_active());
+            sync_highlight_sensitivity(sw.is_active());
+            apply_chrome_font(&state);
+            save_config(&state);
+        });
+    }
+
+    // System metrics in the title bar (Linux only).
+    behavior.attach(&row_label("System metrics in title bar"), 0, 16, 1, 1);
+    let metrics_switch = gtk4::Switch::new();
+    metrics_switch.set_active(state.metrics_enabled.get());
+    metrics_switch.set_halign(Align::Start);
+    metrics_switch.set_sensitive(metrics::SUPPORTED);
+    metrics_switch.set_tooltip_text(Some(if metrics::SUPPORTED {
+        "Show load average, CPU, memory and swap in the title bar."
+    } else {
+        "System metrics are only available on Linux."
+    }));
+    {
+        let state = state.clone();
+        metrics_switch.connect_active_notify(move |sw| {
+            state.metrics_enabled.set(sw.is_active());
+            restart_metrics(&state);
+            save_config(&state);
+        });
+    }
+    behavior.attach(&metrics_switch, 1, 16, 1, 1);
+
+    behavior.attach(&row_label("Metrics interval (seconds)"), 0, 17, 1, 1);
+    let metrics_spin = SpinButton::with_range(
+        metrics::MIN_INTERVAL_SECS as f64,
+        metrics::MAX_INTERVAL_SECS as f64,
+        1.0,
+    );
+    metrics_spin.set_value(state.metrics_interval.get() as f64);
+    metrics_spin.set_halign(Align::Start);
+    metrics_spin.set_sensitive(metrics::SUPPORTED);
+    metrics_spin.set_tooltip_text(Some("How often the title-bar metrics refresh (1–60 s)."));
+    {
+        let state = state.clone();
+        metrics_spin.connect_value_changed(move |s| {
+            state.metrics_interval.set(metrics::clamp_interval(s.value() as u32));
+            restart_metrics(&state);
+            save_config(&state);
+        });
+    }
+    behavior.attach(&metrics_spin, 1, 17, 1, 1);
+
+    // Many rows now: scroll instead of letting the dialog outgrow the screen.
+    let behavior_scroll = ScrolledWindow::new();
+    behavior_scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
+    behavior_scroll.set_vexpand(true);
+    behavior_scroll.set_child(Some(&behavior));
+    notebook.append_page(&behavior_scroll, Some(&Label::new(Some("Behavior"))));
 
     // ── Keybindings ──────────────────────────────────────────────────
     let kb_page = build_keybindings_page(state, &dialog, true);
@@ -5134,3 +5887,7 @@ impl<'a> std::fmt::Debug for DebugBytes<'a> {
         f.write_str("\"")
     }
 }
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;

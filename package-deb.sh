@@ -41,6 +41,9 @@ check_deps() {
 # ── Build ────────────────────────────────────────────────────────────────────
 
 build_release() {
+    info "Running tests..."
+    ./run-tests.sh || die "tests failed — not packaging"
+
     info "Building release binary..."
 
     # rustc >= 1.90 defaults to the bundled rust-lld linker, which does NOT
