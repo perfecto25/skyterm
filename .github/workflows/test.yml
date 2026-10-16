@@ -1,0 +1,42 @@
+name: test
+
+# Run the full test suite on every push / PR: skyterm-core's headless tests and
+# the GUI rule tests in skyterm-gui (menu content/size/colour, tabs, panes,
+# dimming, highlight colour, close confirmation, About window, config). The GUI
+# end-to-end test boots the real app, so it runs under a virtual X display.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  # Reused by release.yml: no release artifact is built unless these pass.
+  workflow_call:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install GTK4 + build dependencies + virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-4-dev libepoxy-dev libfreetype-dev \
+            libfontconfig1-dev libglib2.0-dev \
+            xvfb libgl1-mesa-dri libglx-mesa0 fonts-dejavu-core
+
+      - name: Test
+        # Same linker workaround as the release job (rustc >= 1.90 + multiarch).
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=bfd"
+        run: ./run-tests.sh

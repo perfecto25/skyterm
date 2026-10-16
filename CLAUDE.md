@@ -1,5 +1,7 @@
 # skyterm
 
+@AGENTS.md
+
 A Terminator-like terminal emulator targeting system administrators and developers. Light on resource usage, GPU-rendered glyph drawing, split panes and tabs, themable, configurable fonts/colors.
 
 **Status: M1 done; M2 mostly done (ligatures + italic/underline SGR still missing); M3 done (splits + tabs + menu + selection + shortcuts); M4 substantially done (config load/save + Settings + About + theme swap); M5 not started.** This file is the canonical project context. Read it cold before starting any work.
@@ -45,6 +47,8 @@ What's working end-to-end today:
 - **Double-click word / triple-click line selection.** Multi-click on the left button (counted manually in the `GestureDrag` `begin` handler via event time + cell, since a second gesture would conflict): double = word (`is_word_char` run), triple = whole logical line (expands across soft-wrapped rows via `grid.visible_row_wrapped`). Gated by `click_word_select`. Copy joins soft-wrapped rows without a `\n`.
 - **Copy-on-select.** When `copy_on_select` is on, the `GestureDrag` `connect_end` handler copies the current selection (word, line, or drag) to the clipboard on button release. Default off.
 - **Snap-to-bottom on type.** Typing or pasting while scrolled up snaps the view back to the live screen before bytes reach the PTY.
+- **Focus highlight + dimming.** The focused pane gets a border in `selected_pane_highlight_color` (hex, default `FF3399`) of `selected_pane_highlight_border_size` px (default 2, clamped 1–20), switchable with `selected_pane_highlight` (default true; when false the border width is 0 and the colour/size controls grey out in Settings); every other pane in the tab gets a translucent black scrim (`dim_non_selected_panes`, `dim_non_selected_percent`, default on / 5%, max 50). Both are in Settings → Behavior.
+- **System metrics in the title bar (Linux only).** The window uses a `HeaderBar`; `metrics.rs` reads `/proc/stat`, `/proc/meminfo`, `/proc/loadavg` and a GLib timer writes `load avg: [..]  cpu:%  mem:%  swap:%` into a label packed at the bar's right end (no clicking; tooltip has detail). Config: `system_metrics_enabled` (default true) and `system_metrics_interval_secs` (default 5, clamped 1–60); also in Settings → Behavior. No VRAM (no portable source). Off / hidden on non-Linux. Restarting the timer bumps `metrics_gen` so stale timers stop themselves.
 
 62 tests: 46 in `skyterm-core` (grid/parser — reflow, mouse modes, DECCKM, scroll region, IL/DL, SGR, alt screen, scrollback, DEC graphics — plus config TOML round-trip) and 16 in `skyterm-gui` (keymap: binding parse/display round-trip, per-style default sanity, no-duplicate-combo guard, chord resolution incl. the Ctrl two-pass pair, custom-override layering; font atlas).
 
@@ -172,10 +176,16 @@ Proven empirically: dump the popover's live node tree + `widget.color()` while i
 
 ## Verification
 
-- **Headless tests in `skyterm-core/tests/`** + inline `#[cfg(test)]` modules in `grid.rs`, `parser.rs`, `config.rs` and `keymap.rs`. `cargo test` runs all 62; none need a display.
+- **Run everything with `./run-tests.sh`** (or `./build.sh` = `cargo build` + all tests — plain `cargo build` has no post-build hook). The `package-*.sh` scripts run it first and refuse to package on failure; `.github/workflows/test.yml` runs it on every push/PR under `xvfb-run`.
+- **Headless tests in `skyterm-core/tests/`** + inline `#[cfg(test)]` modules in `grid.rs`, `parser.rs`, `config.rs` and `keymap.rs`. None need a display.
+- **GUI rule tests: `skyterm-gui/src/app_tests.rs`** (a child module of `app.rs`, so it sees private items). Two layers:
+  - *Pure tests* (no display): CSS text rules (no `!important`, 4px focus border, menu `border: none` + 12px radius, About card 14px radius, colours), the menu model (section order, labels, **Close pane slot always last**, every action registered), `dim_scrim`, `close_confirmation`, `normalize_hex_color`.
+  - *`gui_end_to_end`*: boots the real `on_activate` (hooked via the `#[cfg(test)]` `TEST_STATE` thread-local) and drives it — CSS parses with zero errors, right-click menu (width, placement, Close pane mapped + inside the popover, no scrolling, colours, font) for lone pane / after split / short window, focus dimming + clamp + off switch, highlight colour live-swap, selection cleared on focus change, tabs (limit, banner, cycling, toolbar visibility), layouts (2h/2v/3/4), close-pane + last-pane confirmation, About window, config round-trip. All GUI checks live in this ONE `#[test]` because GTK must stay on one thread. It points `XDG_CONFIG_HOME`/`XDG_DATA_HOME` at a temp dir and disables the session bus, so it never touches the real config or a running skyterm. Skipped (with a notice) when there is no display, when `SKYTERM_SKIP_GUI_TESTS` is set, and on macOS (GTK needs the main thread there).
+  - Known gap: the "first popup is clipped" bug only reproduced from a real mouse event, not from a programmatic `show_pane_menu`, so the test still checks the *outcome* (Close pane visible, unclipped) but wouldn't fail if only the re-present workaround in `connect_show` were removed.
+  - Writing a new GUI check? Add a function and call it from `gui_end_to_end`. GTK stores opacity in 8 bits (compare with a tolerance) and re-serialises CSS colours as `rgba(r,g,b,a)` (use `css_has_color`).
 - **End-to-end per milestone**: see "Done when" in each M.
 - **GUI behaviour that tests can't reach** (focus mode geometry, window maximize/minimize, popover/menu internals) has been checked by temporarily instrumenting `on_activate` behind a `SKYTERM_DEBUG_*` env var, running the binary against the real display, and logging the state — e.g. dumping each pane's pixel + grid size before/after a focus toggle, or querying `_NET_WM_STATE` around a maximize. Cheaper and more conclusive than screenshots; delete the hook afterwards. To run a second instance while one is already open, unset the session bus (`DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent`) or GApplication's single-instance handling hands your launch to the running process and exits silently.
-- **CI**: `.github/workflows/release.yml` builds all release artifacts on tag push / manual dispatch. There is no separate test workflow — the Arch leg's `PKGBUILD` `check()` runs `cargo test -p skyterm-core`, which is the only automated test run today.
+- **CI**: `.github/workflows/test.yml` runs `./run-tests.sh` (xvfb) on every push/PR; `.github/workflows/release.yml` builds release artifacts on tag push / manual dispatch (the Arch leg's `PKGBUILD` `check()` runs only `cargo test -p skyterm-core`).
 
 ## Platform caveats
 

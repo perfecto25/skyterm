@@ -40,6 +40,8 @@ Skyterm has the following features:
 - Infinite scrollback
 - built in Themes (future release will add Terminator-compatible theme files)
 - shortcut key bindings - Skyterm or Terminator style, or record your own, with a searchable reference built in
+- Focused-pane highlight - a configurable colored border (or off), with the other panes in the tab gently dimmed
+- Live system metrics in the title bar (Linux) - load average, CPU, memory and swap, so you don't need `top` open
 
 
 Skyterm aims to be basic, fast and no-nonsense terminal emulator tailored for system administrators, developers and anyone who wants a responsive and lightweight terminal that doesnt get in your way. 
@@ -444,6 +446,40 @@ custom themes are declared in a TOML format
 Custom themes will show up in Menu > Themes > Custom
 
 
+#### Pane highlight and dimming
+
+The pane you are working in gets a colored border, and the other panes in the same tab are dimmed slightly so your eye lands on the right one.
+
+| Setting | Config key | Default |
+| --- | --- | --- |
+| Selected pane highlight | `selected_pane_highlight` | `true` |
+| Highlight border size (px) | `selected_pane_highlight_border_size` | `2` (1 - 20) |
+| Selected pane highlight color | `selected_pane_highlight_color` | `FF3399` (hex, `#` optional) |
+| Dim non-selected panes | `dim_non_selected_panes` | `true` |
+| Dim % of non-selected panes | `dim_non_selected_percent` | `5` (0 - 50) |
+
+All five are in Settings > Behavior and apply immediately. Turning the highlight off removes the border entirely, and the border size and color settings are greyed out while it is off. A tab with a single pane is never dimmed.
+
+#### System metrics in the title bar
+
+On Linux the title bar shows a live, top-like summary next to the window buttons - no clicking needed:
+
+```
+load avg: [0.5, 1.2, 2.0]  cpu:30%  mem:50%  swap:20%
+```
+
+- memory is "used" the way `free` and `top` count it (cache is not counted as used)
+- CPU is the busy share since the previous reading, so it shows `--` for the first second after startup
+- hover over it for a longer breakdown
+- when the window is squeezed so the text would crowd the "skyterm" title or the window buttons, the metrics hide themselves (always keeping a clear gap), and come back when the window is wide enough again
+
+| Setting | Config key | Default |
+| --- | --- | --- |
+| System metrics in title bar | `system_metrics_enabled` | `true` |
+| Metrics interval (seconds) | `system_metrics_interval_secs` | `5` (1 - 60) |
+
+Both are in Settings > Behavior. On macOS the metrics are not available yet and the options are greyed out.
+
 ### Custom configuration
 
 additional configration can be applied to your skyterm config file 
@@ -458,6 +494,13 @@ located in ~/.config/skyterm/config.toml
     click_word_select = true
     copy_on_select = false
     shortcut_style = "skyterm"
+    selected_pane_highlight = true
+    selected_pane_highlight_border_size = 2
+    selected_pane_highlight_color = "FF3399"
+    dim_non_selected_panes = true
+    dim_non_selected_percent = 5
+    system_metrics_enabled = true
+    system_metrics_interval_secs = 5
 
 a custom font path can be added to font_path variable
 
@@ -466,6 +509,10 @@ theme_name is the default theme applied to all panes and tabs
 click_word_select toggles double-click-to-select-word and triple-click-to-select-line (set to false to disable). Also available under Settings > Behavior.
 
 copy_on_select automatically copies any selection (word, line, or drag) to the clipboard as soon as you make it (set to true to enable). Also available under Settings > Behavior.
+
+selected_pane_highlight, selected_pane_highlight_border_size and selected_pane_highlight_color control the border around the focused pane; dim_non_selected_panes and dim_non_selected_percent control how much the other panes in the tab are dimmed. See "Pane highlight and dimming" above. Also available under Settings > Behavior.
+
+system_metrics_enabled and system_metrics_interval_secs control the live system metrics in the title bar (Linux). See "System metrics in the title bar" above. Also available under Settings > Behavior.
 
 shortcut_style picks the active keyboard shortcut set - `skyterm`, `terminator` or `custom`. Also available under Settings > Keybindings. With `custom`, each action's combo lives in a `[keybindings]` table written by Settings:
 
@@ -605,9 +652,26 @@ for MacOS builds
     ./package-macos.sh
 
 
+### Testing
+
+Every change should be verified with the full test suite - plain `cargo build` does not run tests, so use
+
+    ./build.sh          # cargo build + all tests
+    ./run-tests.sh      # all tests only (cargo test --workspace)
+
+The suite has two layers:
+
+- **`skyterm-core`** - terminal emulation (grid, parser, scrollback, reflow, mouse modes, config). No display needed.
+- **`skyterm-gui`** - the rules the interface must follow: CSS (no `!important`, parses without errors, menu border / radius / colors), the right-click menu model (Close pane is always there), pane and tab behavior, focus highlight and dimming, close confirmation, the About window, the title-bar metrics (including hiding when squeezed), and config round-trips. One end-to-end test boots the real application and drives it, so it needs a display - `./run-tests.sh` uses `xvfb-run` when it is installed (so no windows flash up on your desktop), uses your normal display otherwise, and skips that one test when there is no display at all. It always points `XDG_CONFIG_HOME` / `XDG_DATA_HOME` at a temp folder, so it never touches your real settings or a running Skyterm.
+
+Set `SKYTERM_SKIP_GUI_TESTS=1` to skip the windowed test. The `package-*.sh` scripts run the suite first and refuse to package if it fails, and GitHub Actions runs it on every push and pull request (`.github/workflows/test.yml`) and before every release build.
+
+Contributors and AI agents: see `AGENTS.md` - the rule is to run the tests after every build and to add a test with every change.
+
+
 ### Releases
 
-Releases are built by `.github/workflows/release.yml` on GitHub's free runners. Push a version tag and every artifact is built and attached to a GitHub Release:
+Releases are built by `.github/workflows/release.yml` on GitHub's free runners. The test suite runs first and no artifact is built unless it passes. Push a version tag and every artifact is built and attached to a GitHub Release:
 
     git tag -a v0.1.8 -m 'release 0.1.8'
     git push origin --tags
@@ -631,6 +695,30 @@ To re-run a release for an existing tag
 
 
 ### Changelog
+
+#### 0.1.9
+
+- system metrics in the title bar (Linux): load average, CPU, memory and swap, refreshed every few seconds - `system_metrics_enabled` and `system_metrics_interval_secs` in the config file, or Settings > Behavior. Hides automatically when the window is too narrow to show it cleanly
+- the "skyterm" title is now on the left of a more compact (about 20% shorter) title bar
+- focused pane highlight is now configurable:
+
+  - color (`selected_pane_highlight_color`, hex, default FF3399), border size (`selected_pane_highlight_border_size`, default 2 px), or switch it off (`selected_pane_highlight`) - the size and color settings grey out when it is off
+  - the first pane of a new tab now shows the highlight border straight away (it used to appear only after a click)
+
+- dim the panes that don't have focus (`dim_non_selected_panes`, `dim_non_selected_percent`, default on at 5%)
+- fixes:
+
+  - Close pane was missing from the right-click menu on the original pane after a split, and on the first menu opened in a short window - it is now always in the menu, and closing the very last pane asks for confirmation before quitting
+  - double / triple-clicking blank space, or clicking into another pane, no longer leaves stray highlighted blocks behind
+  - right-click menu: no white border, rounded corners, and it now uses the terminal font
+  - About window: now has the Skyterm logo, rounded corners on every background, closes on click outside, Escape or the close button
+  - invalid CSS in the menu stylesheet that GTK warned about on every start
+
+- tests and builds:
+
+  - new automated test suite for the interface (menu, tabs, panes, colors, dimming, highlight, About window, metrics, config) - run with `./build.sh` or `./run-tests.sh`; see the Testing section
+  - GitHub Actions runs the tests on every push / pull request and before every release build; the Arch package build now runs them too
+  - the `package-*.sh` scripts run the tests before packaging
 
 #### 0.1.8
 

@@ -49,6 +49,32 @@ pub struct Config {
     /// Show the floating drag/close toolbar on split panes. `None` / absent means enabled.
     #[serde(default)]
     pub show_pane_toolbar: Option<bool>,
+    /// Dim the panes that don't have focus. `None` / absent means enabled.
+    #[serde(default)]
+    pub dim_non_selected_panes: Option<bool>,
+    /// How much to dim non-selected panes, as a percentage (0–50). `None` /
+    /// absent means 5.
+    #[serde(default)]
+    pub dim_non_selected_percent: Option<u32>,
+    /// Border colour of the focused pane as a 6-digit hex code (`FF3399`, a
+    /// leading `#` is tolerated). `None` / absent means `FF3399`.
+    #[serde(default)]
+    pub selected_pane_highlight_color: Option<String>,
+    /// Highlight the focused pane with a coloured border. `None` / absent
+    /// means enabled.
+    #[serde(default)]
+    pub selected_pane_highlight: Option<bool>,
+    /// Thickness of the focused-pane border in pixels (1–20). `None` /
+    /// absent means 2. Ignored when `selected_pane_highlight` is false.
+    #[serde(default)]
+    pub selected_pane_highlight_border_size: Option<u32>,
+    /// Show live system metrics (load, CPU, memory, swap) in the title bar.
+    /// Linux only. `None` / absent means enabled.
+    #[serde(default)]
+    pub system_metrics_enabled: Option<bool>,
+    /// Seconds between metric refreshes (1–60). `None` / absent means 5.
+    #[serde(default)]
+    pub system_metrics_interval_secs: Option<u32>,
     /// Pane layout applied to each new window on startup. One of `single`,
     /// `2h`, `2v`, `3`, `4`. `None` / absent means `single`.
     #[serde(default)]
@@ -128,6 +154,13 @@ mod tests {
             confirm_pane_close: Some(false),
             confirm_window_close: Some(true),
             show_pane_toolbar: Some(true),
+            dim_non_selected_panes: Some(true),
+            dim_non_selected_percent: Some(7),
+            selected_pane_highlight_color: Some("FF3399".to_string()),
+            selected_pane_highlight: Some(false),
+            selected_pane_highlight_border_size: Some(8),
+            system_metrics_enabled: Some(false),
+            system_metrics_interval_secs: Some(9),
             default_layout: Some("2v".to_string()),
             shortcut_style: Some("custom".to_string()),
             keybindings: Some(keys.clone()),
@@ -137,6 +170,13 @@ mod tests {
         assert_eq!(back.shortcut_style.as_deref(), Some("custom"));
         assert_eq!(back.keybindings, Some(keys));
         assert_eq!(back.default_layout.as_deref(), Some("2v"));
+        assert_eq!(back.dim_non_selected_panes, Some(true));
+        assert_eq!(back.dim_non_selected_percent, Some(7));
+        assert_eq!(back.selected_pane_highlight_color.as_deref(), Some("FF3399"));
+        assert_eq!(back.selected_pane_highlight, Some(false));
+        assert_eq!(back.selected_pane_highlight_border_size, Some(8));
+        assert_eq!(back.system_metrics_enabled, Some(false));
+        assert_eq!(back.system_metrics_interval_secs, Some(9));
     }
 
     /// A config written by an older skyterm has neither new key, and must keep

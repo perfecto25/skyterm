@@ -46,7 +46,10 @@ build() {
 
 check() {
     cd "$_repo"
-    cargo test --locked --package skyterm-core
+    # Whole workspace, so the GUI crate's display-free tests (CSS rules, menu
+    # model, config, metrics parsing) run too. The windowed end-to-end test
+    # needs a display, which the build container doesn't have — skip it.
+    SKYTERM_SKIP_GUI_TESTS=1 cargo test --locked --workspace
 }
 
 package() {

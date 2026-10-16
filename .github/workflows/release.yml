@@ -37,8 +37,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The full test suite (core + GUI rule tests under a virtual display) must
+  # pass before any artifact is built.
+  test:
+    name: tests
+    uses: ./.github/workflows/test.yml
+
   linux:
     name: linux-${{ matrix.arch }}
+    needs: [test]
     strategy:
       fail-fast: false
       matrix:
@@ -88,6 +95,7 @@ jobs:
 
   arch-linux:
     name: arch-x86_64
+    needs: [test]
     runs-on: ubuntu-24.04
     # Build inside the official Arch image: an Arch package has to be linked
     # against Arch's own GTK4 / glibc, so it can't be produced on the Ubuntu
@@ -130,6 +138,7 @@ jobs:
 
   macos:
     name: macos-${{ matrix.arch }}
+    needs: [test]
     strategy:
       fail-fast: false
       matrix:
